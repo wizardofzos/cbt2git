@@ -5,7 +5,32 @@ Refresh without any new or updated files takes abount 90 seconds.
 Don't go beyond 15 simultaneous threads when downloading as ftp.cbttape.org doesn't really like that.
 
 Usage:
-    ./get-cbtzips-locally.py
+    ./usage: get-cbtzips-locally.py [-h] [--stage STAGE] [--threads THREADS] [--pickle PICKLE] [--force] [--updates]
+    options:
+    -h, --help         show this help message and exit
+    --stage STAGE      Full path to stage-foler. 
+                        This is where all files from cbttape.org are staged.
+                        Defaults to {cwd}/stage
+    --threads THREADS  Simultaneous FTP threads for downloads. Defaults to 15
+    --pickle PICKLE    Panda pickle file to save CBT's UPDATESTOC.txt information to. Defaults to {cwd}/cbt.pkl
+    --force            Ingore filesizes, always download everything.
+    --updates          Only check and download the updates from cbttape.org.    
+
+Data from UPDATESTOC.txt is parsed and stored in a Pandas DataFrame
+
+     cbtnum                     path                                            comment  updated      info
+0       001   pub/updates/CBT001.zip           CBT DOC - Final File 001 for Version 504     True  DOC FILE
+1       002       pub/cbt/CBT002.zip  CBT973 Compression-Decompression Program for F...    False  DOC FILE
+2       003       pub/cbt/CBT003.zip          JCL member to load each tape file to disk    False  DOC FILE
+3       004       pub/cbt/CBT004.zip      Put ./ ADD cards into this file to make a PDS    False  DOC FILE
+4       005       pub/cbt/CBT005.zip          VMREXX exec to load CBT tape to VM - V2.0    False  DOC FILE
+...     ...                      ...                                                ...      ...       ...
+1035   1036  pub/updates/CBT1036.zip     OS/360 Sort/Merge fixed by Tom Armstrong w/doc     True  DOC FILE
+1036   1037  pub/updates/CBT1037.zip  Disassembler from Gerhard Postpischil and T.Ar...     True  DOC FILE
+1037   1038  pub/updates/CBT1038.zip     System Rexx to Modify the Linklist dynamically     True  DOC FILE
+1038   1039  pub/updates/CBT1039.zip    Version of the LOOK storage browser for MVS 3.8     True  DOC FILE
+1039   1040  pub/updates/CBT1040.zip  Frank Clarke execs-enhance PL/I listings and s...     True  DOC FILE
+
 
 Author:
     Wizard of z/OS 
@@ -13,6 +38,7 @@ Author:
 Version:
     1.0 : Inital Version
     1.1 : Added some argparsing
+    1.2 : More docs (I'll thank myself later)
 
 Todo:
     - Use MLSD to parse full list and get remote dates. Stick in pandas dataframe as column
@@ -50,8 +76,8 @@ parser.add_argument("--threads", type=int,
                     help=f"""Simultaneous FTP threads for downloads. Defaults to 15""")
 
 parser.add_argument("--pickle", type=str,
-                    default=f'{os.getcwd()}/cbt.pkl',
-                    help=f"""Panda pickle file to save CBT's UPDATESTOC.txt information to. Defaults to {os.getcwd()}/cbt.pkl""")
+                    default=f'.cbt.pkl',
+                    help=f"""Panda pickle file to save CBT's UPDATESTOC.txt information to. Defaults to ./cbt.pkl""")
 
 
 
