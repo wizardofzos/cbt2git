@@ -1,4 +1,4 @@
-# cbt2git
+# cbt2git (Work In Progress!)
 
 cbt2git is a set of Python tools/scripts to migrate CBT (Consolidated Software Library) tapes from cbttape.org to GitHub repositories, making them easier to access and use for a wider audience. 
 
