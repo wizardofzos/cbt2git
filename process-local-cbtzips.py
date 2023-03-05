@@ -57,11 +57,15 @@ parser.add_argument("--pickle", type=str,
 
 parser.add_argument("--clean",
                     action="store_true",
-                    help=f"Cleans everything except stage folder.")
+                    help=f"Cleans everything except stage folder. Does not take --only into account...")
 
 parser.add_argument("--force",
                     action="store_true",
                     help=f"Ingore filesizes, always download everything.")
+
+parser.add_argument("--noremote",
+                    action="store_true",
+                    help=f"Do everything, except remote GitHub actions. (doen't create or updates repos")
 
 
 
@@ -74,8 +78,11 @@ stage    = args.stage
 only     = args.only
 cbtfiles = args.cbtfiles
 pickle   = args.pickle
+noremote = args.noremote
 
-    
+docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf']
+
+fulllog = []
 
 
 
@@ -95,13 +102,17 @@ from github import Github
 github = Github(GITHUB_TOKEN)
 me = github.get_organization(GITHUB_USER_OR_ORG)
 
-try:
-    GITHUB_USER = me.login
-except:
-    print("Bad token... bad")
-    exit(4)
 
-print(f"Token has logged on {github.get_user(GITHUB_USER).name} acting in github user/org github.com/{GITHUB_USER}")
+if not noremote:
+    try:
+        GITHUB_USER = me.login
+    except:
+        print("Bad token... bad")
+        exit(4)
+
+    print(f"Token has logged on {github.get_user(GITHUB_USER).name} acting in github user/org github.com/{GITHUB_USER}")
+else:
+    print("Running locally only, no updates to GitHub")
 
 
 
@@ -114,12 +125,13 @@ if args.clean:
     """
     os.system(f'rm -rf {cbtfiles}/*')
     os.system(f'rm -rf {repos}/*')
-    for repo in me.get_repos():
-        if repo.name[:3] == "CBT":
-            print(f"Deleting {repo.name}", end=' ', flush=True)
-            r = me.get_repo(repo.name)
-            r.delete()
-            print("🗑️", flush=True)
+    if not noremote:
+        for repo in me.get_repos():
+            if repo.name[:3] == "CBT":
+                print(f"Deleting {repo.name}", end=' ', flush=True)
+                r = me.get_repo(repo.name)
+                r.delete()
+                print("🗑️", flush=True)
 
 if not os.path.isdir(repos):
     os.mkdir(repos)
@@ -160,7 +172,41 @@ def attribfile(path):
     with open(f'{path}/.gitattributes', 'w') as a:
         a.writelines(lines)
 
-
+def getxmidata(xmifile):
+    xmijson = json.loads(xmi.open_file(xmifile,quiet=True).get_json())
+    try:
+        dsnam = xmijson['INMR02']['1']['INMDSNAM']
+    except:
+        try:
+            dsnam = xmijson['INMR02']['2']['INMDSNAM']
+        except:
+            return False, False, False, False, False
+    dsorg = xmijson['INMR02']['1']['INMDSORG']
+    lrecl = xmijson['INMR02']['1']['INMLRECL']
+    if dsorg != "PS":
+        mbrs = [x for x in xmijson['file'][dsnam]['members']]
+    else:
+        mbrs = []
+    try:
+        recfm  = xmijson['file'][dsnam]['COPYR1']['DS1RECFM']
+    except:
+        recfm = 'n.a.'
+    members = {}
+    for m in mbrs:
+        if 'mimetype' in xmijson['file'][dsnam]['members'][m]:
+            mt = xmijson['file'][dsnam]['members'][m]['mimetype']
+        else:
+            mt = 'application/octet-stream' # force it :)
+        if 'datatype' in xmijson['file'][dsnam]['members'][m]:
+            dt = xmijson['file'][dsnam]['members'][m]['datatype']
+        else:
+            dt = 'binary'
+        if 'extension' in xmijson['file'][dsnam]['members'][m]:
+            ext = xmijson['file'][dsnam]['members'][m]['extension']
+        else:
+            ext = '.bin'
+        members[m] = {'mimetype': mt, 'datatype':dt,'ext':ext}
+    return dsnam, dsorg, lrecl, recfm, members
 
 
 
@@ -178,7 +224,7 @@ flist = os.listdir(stage)
 for i,filename in enumerate(flist):
     # I've we selected a CBT, oly do that one
     if only > 0:
-        cbtn = f"CBT{only:002d}.zip" 
+        cbtn = f"CBT{only:003d}.zip" 
         if filename != cbtn: 
             continue
     # otherwise process this src CBT file..
@@ -220,7 +266,8 @@ for i,z in enumerate(toprocess):
             try:
                 contents = xmi.list_all(xmifile)
             except:
-                print(f"** ALERT ** {z} has no XMI??")
+                print('')
+                print(f"** ALERT ** {z} is zipped version of {xmifile} but that's no XMI??")
                 continue
             pdsfile  = contents[0].split('(')[0]
             
@@ -262,8 +309,14 @@ for i,z in enumerate(toprocess):
             dotzigispf[mainpds] = []
             for member in xmijson['file'][xmi_file]['members']:
                 member_info = xmijson['file'][xmi_file]['members'][member]
-                mimetype = member_info['mimetype']
-                ext = member_info['extension']
+                if 'mimetype' in member_info:
+                    mimetype = member_info['mimetype']
+                else:
+                    mimetype = 'application/octet-stream'
+                if 'extension' in member_info:
+                    ext = member_info['extension']
+                else:
+                    ext = '.bin'
                 newmember = member.split('.')[0]                
                 if mimetype == 'text/plain':
                     # we just copy this over inside our repopath
@@ -368,17 +421,34 @@ for i,z in enumerate(toprocess):
 
                 else:
                     # most likely a binary, move outside of pds in repo as bin file with extension as provided from xmilib
-                    loglines.append(f'{datetime.datetime.now()} - Skipped de-xmi-ing {member} as it contained {mimetype}'+ '\n')
-                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}.xmi'") # as replaced with the XMI file
-                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                                xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                                xmipds.write(f"# |{'AN UNSUPPORTED MIME-TYPE'.center(55)}" + "|\n")
-                                xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                                xmipds.write(f"# |{'XMI data STORED AS'.center(55)}" + "|\n")
-                                place = f'{reponame}/{member}.xmi'
-                                xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                    if mimetype in docmimetypes:
+                        # create the docs folder and move there
+                        target = f'{repopath}/docs'
+                        os.system(f'mkdir -p {target}')
+                        # extract xmi to target
+                        os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{target}/{member}{ext}'")
+                        loglines.append(f'{datetime.datetime.now()} - De-xmi-ed {member} to {reponame}/docs/{member}{ext}'+ '\n')
+                        with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
+                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                                    xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
+                                    xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
+                                    xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
+                                    xmipds.write(f"# |{'De-XMI-ed data STORED AS'.center(55)}" + "|\n")
+                                    place = f'{reponame}/docs/{member}{ext}'
+                                    xmipds.write(f"# |{place.center(55)}" + "|\n") 
+                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                    else:
+                        loglines.append(f'{datetime.datetime.now()} - Skipped de-xmi-ing {member} as it contained {mimetype}'+ '\n')
+                        os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}.xmi'") # as replaced with the XMI file
+                        with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
+                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                                    xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
+                                    xmipds.write(f"# |{'AN UNSUPPORTED MIME-TYPE'.center(55)}" + "|\n")
+                                    xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
+                                    xmipds.write(f"# |{'XMI data STORED AS'.center(55)}" + "|\n")
+                                    place = f'{reponame}/{member}.xmi'
+                                    xmipds.write(f"# |{place.center(55)}" + "|\n") 
+                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
                     # add gitattribs...
 
             # Also get the @FILEnnn into README
@@ -393,11 +463,13 @@ for i,z in enumerate(toprocess):
 
             # Now this is ugly as MD... so do some magix with it
             nl = "\n"
-            os.system(f'echo "~~~~~~~~~~~~~~~~{nl}" > {repopath}/README.md')
+            os.system(f'echo "# {reponame}{nl}Converted to GitHub via [cbt2git](https://github.com/wizardofzos/cbt2git)" > {repopath}/README.md')
+            os.system(f'echo "This is still a work in progress..." >> {repopath}/README.md')
+            os.system(f'echo "~~~~~~~~~~~~~~~~{nl}" >> {repopath}/README.md')
             os.system(f'{cccc} >> {repopath}/README.md')
             os.system(f'echo "~~~~~~~~~~~~~~~~{nl}" >> {repopath}/README.md')
 
-            # all parsed, write zigi files to repo
+            # all parsed, write zigi files to repo (replaces existing...and that's what we want)
             os.system(f'mkdir {repopath}/.zigi')
             with open(f'{repopath}/.zigi/dsn', 'w') as dsnfile:
                 dsnfile.writelines(dotzigidsn)
@@ -405,7 +477,10 @@ for i,z in enumerate(toprocess):
                 with open(f'{repopath}/.zigi/{p}', 'w') as ispffile:
                     ispffile.writelines(dotzigispf[p])
 
-            with open(f'{repopath}/cbt2git.log', 'w') as dalog:
+            # Do the thing with the pdf's docx et-al
+
+            # Append to logfile if we have one, otherwise create it
+            with open(f'{repopath}/cbt2git.log', 'a+') as dalog:
                 dalog.writelines(loglines)
             
             if new_repo:
@@ -420,44 +495,50 @@ for i,z in enumerate(toprocess):
             else:
                 # we're newer, so update the things..
                 os.system(f'cd {repopath} && git add .')
-                os.system(f'cd {repopath} && git commit -m "Updates from cbttape.org"')
+                os.system(f'cd {repopath} && git commit -m "Updates from cbttape.org ({datetime.datetime.now().strftime("%Y-%m-%d")})')
             
             create_repo = False
 
-            try:
-                repo = github.get_repo(f'{GITHUB_USER}/{reponame}')
-            except:
-                create_repo = True
-            
-            print(f"Check for {reponame} /  ==> have to create: {create_repo}")
-            if create_repo:
-                # create the repo at the github site
-                me.create_repo(
-                    reponame,
-                    private=True,
-                    description=cbt.loc[cbt.cbtnum==cbtnum]['comment'].values[0]
-                )
-                # sleep a bit....... github seems to lag on creation?
+            if not noremote:
+                try:
+                    repo = github.get_repo(f'{GITHUB_USER}/{reponame}')
+                except:
+                    create_repo = True
                 
-                time.sleep(6) # just to be sure :)
-                repourl = f'git@github.com:cbttape/{reponame}.git' 
-                repourl = me.get_repo(reponame).ssh_url
-                print(f'Created {reponame} at {repourl} adding origin')
-                os.system(f'cd {repopath} && git remote add origin {repourl}')
-                print(f'cd {repopath} && git push -v -u origin main')
-                os.system(f'cd {repopath} && git push -u origin main')
-            
-            # repo was there, we can justpush our updates
-            os.system(f'cd {repopath} && git push origin main')
-            rate_used, rate_init = github.rate_limiting
-            print(f"Rate critical? ({rate_used}/{rate_init})")
-            gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
-            if gracetime > 0:
-                print(f'Sleep for grace time...{gracetime} secs')
-                time.sleep(gracetime)
-            while rate_used < 500:
-                # Just to be on the safe side (https://docs.github.com/en/rest/overview/resources-in-the-rest-api#secondary-rate-limits)
-                # we might wanna add some more sleeps....
-                print(f"Sleep 60 to keep the rate-limit-things happy")
-                time.sleep(60)
+                print(f"Check for {reponame} /  ==> have to create: {create_repo}")
+                if create_repo:
+                    # create the repo at the github site
+                    me.create_repo(
+                        reponame,
+                        private=True,
+                        description=cbt.loc[cbt.cbtnum==cbtnum]['comment'].values[0]
+                    )
+                    # sleep a bit....... github seems to lag on creation?
+                    
+                    time.sleep(6) # just to be sure :)
+                    repourl = f'git@github.com:cbttape/{reponame}.git' 
+                    repourl = me.get_repo(reponame).ssh_url
+                    print(f'Created {reponame} at {repourl} adding origin')
+                    os.system(f'cd {repopath} && git remote add origin {repourl}')
+                    print(f'cd {repopath} && git push -v -u origin main')
+                    os.system(f'cd {repopath} && git push -u origin main')
 
+                # repo was there, we can justpush our updates
+                os.system(f'cd {repopath} && git push origin main')
+                rate_used, rate_init = github.rate_limiting
+                print(f"Rate critical? ({rate_used}/{rate_init})")
+                gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
+                if gracetime > 0:
+                    print(f'Sleep for grace time...{gracetime} secs')
+                    time.sleep(gracetime)
+                while rate_used < 500:
+                    # Just to be on the safe side (https://docs.github.com/en/rest/overview/resources-in-the-rest-api#secondary-rate-limits)
+                    # we might wanna add some more sleeps....
+                    print(f"Sleep 60 to keep the rate-limit-things happy")
+                    time.sleep(60)
+            
+    fulllog += loglines
+
+logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y%-j")}'
+with open(logfile, 'w') as biglog:
+    biglog.writelines(fulllog)
