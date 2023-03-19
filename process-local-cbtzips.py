@@ -80,7 +80,7 @@ cbtfiles = args.cbtfiles
 pickle   = args.pickle
 noremote = args.noremote
 
-docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf']
+docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.oasis.opendocument.text','application/vnd.oasis.opendocument.text','application/vnd.ms-powerpoint','application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.presentationml.presentation']
 
 fulllog = []
 
@@ -241,7 +241,8 @@ for i,filename in enumerate(flist):
         print(f"Sorry, {src} not found. This really shouldn't happen.")
 
 print(f"Need to process {len(toprocess)} CBT zips")
-
+# Let's sort them :)
+toprocess = sorted(toprocess)
 
 
 for i,z in enumerate(toprocess):
@@ -268,15 +269,23 @@ for i,z in enumerate(toprocess):
             except:
                 print('')
                 print(f"** ALERT ** {z} is zipped version of {xmifile} but that's no XMI??")
+                fulllog.append(f"** ALERT ** {z} is zipped version of {xmifile} but that's no XMI??")
                 continue
+
+            if contents == []:
+                # FILE062 has this too ...
+                print(f"** ALERT ** {z} unzipped to {xmifile} but that's not an XMI??")
+                fulllog.append(f"** ALERT ** {z} unzipped to {xmifile} but that's not an XMI??")
+                continue
+
             pdsfile  = contents[0].split('(')[0]
-            
+
             try:
-                
                 xmi_obj = xmi.open_file(xmifile,quiet=True)
             except:
                 print(f"De-XMI error for {z}")
                 continue
+
             xmijson = xmi_obj.get_json()
             new_repo = False
             repopath = repos + "/" + z.split('/')[1].split('.')[0]
@@ -326,7 +335,7 @@ for i,z in enumerate(toprocess):
                     if not member_info['ispf']:
                         member_info['ispf'] = {'version': '01.00', 'flags': 0, 'createdate': '1976-06-12T00:00:00.000000', 'modifydate': '1976-06-12T22:18:12.000000', 'lines': 0, 'newlines': 0, 'modlines': 0, 'user': 'CBT2GIT'}
                     dotzigispf[mainpds].append(ispfstatsfromxmi(member, member_info['ispf'])+"\n")
-                    loglines.append(f'{datetime.datetime.now()} - Found {member}{member_info["extension"]} ({member_info["mimetype"]}) in {pdsfile} moved to {mainpds}/{member}' + '\n')
+                    loglines.append(f'{datetime.datetime.now()} - Found {member}{member_info["extension"]} ({member_info["mimetype"]}) in {pdsfile}, moved to {mainpds}/{member}' + '\n')
                 elif mimetype == 'application/xmit':
                     # we should assume this has no more nested xmi's and de-xmit it outside of the pds as a new pds
                     # dexmi, move
@@ -379,7 +388,7 @@ for i,z in enumerate(toprocess):
                         blksz = nested_xmijson['INMR02']['1']['INMBLKSZ']
                         if recfm != "U":
                             ok = f'{repopath}/{newnestpds}'
-                            loglines.append(f'{datetime.datetime.now()} - Extracted to {ok}' + '\n')
+                            loglines.append(f'{datetime.datetime.now()}   - Received to {reponame}/{newnestpds}' + '\n')
                             with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
                                 xmipds.write(f"# +-------------------------------------------------------+" + "\n")
                                 xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI FILE'.center(55)}" +  "|\n")
@@ -409,7 +418,7 @@ for i,z in enumerate(toprocess):
                                 xmipds.write(f"# |{'THE ORIGINAL XMI HAS MOVED TO'.center(55)}" + "|\n")
                                 xmipds.write(f"# |{(reponame + '/' + member + ext).center(55)}" + "|\n") 
                                 xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                            loglines.append(f'{datetime.datetime.now()} - De-XMI showed RECFM=U, stored XMIT file as {member}{ext}' + '\n')
+                            loglines.append(f'{datetime.datetime.now()}   - Received RECFM=U data, stored XMIT file as {reponame}/{member}{ext}' + '\n')
                             dd = datetime.datetime.now().strftime("%y/%m/%d")
                             mm = datetime.datetime.now().strftime('%H:%M:%S')
                             newispf = f"{member:<8} {dd} {dd} {1:>2} {0:>2} {mm} {7:>5} {7:>5} {0:>5} CBT2GIT"
@@ -419,37 +428,67 @@ for i,z in enumerate(toprocess):
                     
 
 
+                elif mimetype in docmimetypes:
+                    # create the docs folder and move there
+                    target = f'{repopath}/docs'
+                    os.system(f'mkdir -p {target}')
+                    # extract xmi to target
+                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{target}/{member}{ext}'")
+                    loglines.append(f'{datetime.datetime.now()} - De-xmi-ed {member} to {reponame}/docs/{member}{ext}'+ '\n')
+                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
+                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                                xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
+                                xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
+                                xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
+                                xmipds.write(f"# |{'De-XMI-ed data STORED AS'.center(55)}" + "|\n")
+                                place = f'{reponame}/docs/{member}{ext}'
+                                xmipds.write(f"# |{place.center(55)}" + "|\n") 
+                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+
+                elif mimetype == 'application/zip':
+                    target = f'{repopath}/{member}'
+                    with zipfile.ZipFile(f'/tmp/{pdsfile}/{member}{ext}', 'r') as inner_zip:
+                        print(f'extracting to {target}')
+                        loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} ({mimetype}), extracted to {reponame}/{member}'+ '\n')
+                        inner_zip.extractall(target)
+                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
+                        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                        xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
+                        xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
+                        xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
+                        xmipds.write(f"# |{'RECEIVED AND UNZIPPED TO'.center(55)}" + "|\n")
+                        place = f'{reponame}/{member}'
+                        xmipds.write(f"# |{place.center(55)}" + "|\n") 
+                        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+
+                elif mimetype in ['application/java-archive', 'message/rfc822']:
+                    target = f'{repopath}/{member}'
+                    os.system(f'mkdir -p {target}')
+                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{target}/{member}{ext}'")
+                    loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} ({mimetype}), moved to {reponame}/{member}{ext}'+ '\n')
+                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
+                        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                        xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
+                        xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
+                        xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
+                        xmipds.write(f"# |{'RECEIVED MOVED TO'.center(55)}" + "|\n")
+                        place = f'{reponame}/{member}{ext}'
+                        xmipds.write(f"# |{place.center(55)}" + "|\n") 
+                        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+
                 else:
-                    # most likely a binary, move outside of pds in repo as bin file with extension as provided from xmilib
-                    if mimetype in docmimetypes:
-                        # create the docs folder and move there
-                        target = f'{repopath}/docs'
-                        os.system(f'mkdir -p {target}')
-                        # extract xmi to target
-                        os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{target}/{member}{ext}'")
-                        loglines.append(f'{datetime.datetime.now()} - De-xmi-ed {member} to {reponame}/docs/{member}{ext}'+ '\n')
-                        with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                                    xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                                    xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
-                                    xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                                    xmipds.write(f"# |{'De-XMI-ed data STORED AS'.center(55)}" + "|\n")
-                                    place = f'{reponame}/docs/{member}{ext}'
-                                    xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                    else:
-                        loglines.append(f'{datetime.datetime.now()} - Skipped de-xmi-ing {member} as it contained {mimetype}'+ '\n')
-                        os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}.xmi'") # as replaced with the XMI file
-                        with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                                    xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                                    xmipds.write(f"# |{'AN UNSUPPORTED MIME-TYPE'.center(55)}" + "|\n")
-                                    xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                                    xmipds.write(f"# |{'XMI data STORED AS'.center(55)}" + "|\n")
-                                    place = f'{reponame}/{member}.xmi'
-                                    xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                                    xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                    # add gitattribs...
+                    loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {reponame}/{member}{ext}'+ '\n')
+                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}.xmi'") # as replaced with the XMI file
+                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
+                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                                xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
+                                xmipds.write(f"# |{'AN UNSUPPORTED MIME-TYPE'.center(55)}" + "|\n")
+                                xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
+                                xmipds.write(f"# |{'XMI data STORED AS'.center(55)}" + "|\n")
+                                place = f'{reponame}/{member}.xmi'
+                                xmipds.write(f"# |{place.center(55)}" + "|\n") 
+                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+
 
             # Also get the @FILEnnn into README
             files  = glob.glob(repopath + f"/*{mainpds}/@FIL*")
@@ -507,14 +546,21 @@ for i,z in enumerate(toprocess):
                 
                 print(f"Check for {reponame} /  ==> have to create: {create_repo}")
                 if create_repo:
-                    # create the repo at the github site
-                    me.create_repo(
-                        reponame,
-                        private=False,
-                        description=cbt.loc[cbt.cbtnum==cbtnum]['comment'].values[0]
-                    )
+                    # create the repo at the github site, check for breakage...
+                    try:
+                        me.create_repo(
+                            reponame,
+                            private=False,
+                            description=cbt.loc[cbt.cbtnum==cbtnum]['comment'].values[0]
+                        )
+                    except:
+                        print("** SOMETHING BAD WHEN CREATING REPO (RATE LIMITS?)")
+                        logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
+                        with open(logfile, 'w') as biglog:
+                            biglog.writelines(fulllog)
+                        # then sleep for long, so I get to keep this running unattended!
+                        time.sleep(1800)
                     # sleep a bit....... github seems to lag on creation?
-                    
                     time.sleep(10) # just to be sure :)
                     repourl = f'git@github.com:cbttape/{reponame}.git' 
                     repourl = me.get_repo(reponame).ssh_url
@@ -532,12 +578,13 @@ for i,z in enumerate(toprocess):
                     print(f'Sleep for trice the grace time...{gracetime*3} secs')
                     time.sleep(gracetime*3)
                 # and wait another minute (we're not in a rush :) )
-                if i % 10 == 0:
+                if i % 10 == 0 and only == 0:
+                    # every 10, and not if we running just one...
                     print("Sleep another minute every 10 repos...")
                     time.sleep(60)
             
     fulllog += loglines
 
-logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y%-j")}'
+logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
 with open(logfile, 'w') as biglog:
     biglog.writelines(fulllog)
