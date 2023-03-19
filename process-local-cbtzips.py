@@ -510,12 +510,12 @@ for i,z in enumerate(toprocess):
                     # create the repo at the github site
                     me.create_repo(
                         reponame,
-                        private=True,
+                        private=False,
                         description=cbt.loc[cbt.cbtnum==cbtnum]['comment'].values[0]
                     )
                     # sleep a bit....... github seems to lag on creation?
                     
-                    time.sleep(6) # just to be sure :)
+                    time.sleep(10) # just to be sure :)
                     repourl = f'git@github.com:cbttape/{reponame}.git' 
                     repourl = me.get_repo(reponame).ssh_url
                     print(f'Created {reponame} at {repourl} adding origin')
@@ -529,12 +529,11 @@ for i,z in enumerate(toprocess):
                 print(f"Rate critical? ({rate_used}/{rate_init})")
                 gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
                 if gracetime > 0:
-                    print(f'Sleep for grace time...{gracetime} secs')
-                    time.sleep(gracetime)
-                while rate_used < 500:
-                    # Just to be on the safe side (https://docs.github.com/en/rest/overview/resources-in-the-rest-api#secondary-rate-limits)
-                    # we might wanna add some more sleeps....
-                    print(f"Sleep 60 to keep the rate-limit-things happy")
+                    print(f'Sleep for trice the grace time...{gracetime*3} secs')
+                    time.sleep(gracetime*3)
+                # and wait another minute (we're not in a rush :) )
+                if i % 10 == 0:
+                    print("Sleep another minute every 10 repos...")
                     time.sleep(60)
             
     fulllog += loglines
