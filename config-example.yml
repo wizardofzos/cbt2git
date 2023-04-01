@@ -1,3 +1,4 @@
-github:
+# Token needs to be classic (and needs delete repo auth)
   token: YOUR_GITHUB_TOKEN_HERE
   name: YOUR_NAME_OR_ORGANIZATION_HERE
+

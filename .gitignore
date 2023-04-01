@@ -1,0 +1,10 @@
+virtualenv/bin/*
+virtualenv/include/*
+virtualenv/lib*
+virtualenv/pyvenv.cfg
+.cbtrepos/*
+cbt2git-log*
+cbtfiles/*
+cbtraw/*
+.cbtfiles/*
+*.pkl
