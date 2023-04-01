@@ -95,6 +95,8 @@ args = parser.parse_args()
 MAX_THREAD_DOWNLOADS = args.threads
 stage = args.stage
 
+os.system(f"mkdir -p {stage}")
+
 def threaded_download(remotefile,storeat,ftpserver):
     """Do a threaded download.
 
