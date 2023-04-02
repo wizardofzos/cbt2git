@@ -643,6 +643,9 @@ for i,z in enumerate(toprocess):
                     time.sleep(60)
     # add log from this conersion to main full log
     fulllog += loglines
+    # cleanup /tmp stuff
+    os.system(f'rm -rf /tmp/{pdsfile}')
+    os.system(f'rm -rf /tmp/{xmifile}')
 
 # sort on datetime (as we have extra messages in it from fulllog.append warnings that don't show in repo)
 fulllog = sorted(fulllog)
