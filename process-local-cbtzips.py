@@ -541,7 +541,6 @@ for i,z in enumerate(toprocess):
                 else:
                     loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {mainpds}/{member}'+ '\n')
                     res = os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{pdsfolder}/{member}' > /dev/null 2>&1") # as replaced with the XMI file
-                    print(res)
                     # loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {reponame}/{member}{ext}'+ '\n')
                     # os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}{ext}' > /dev/null 2>&1") # as replaced with the XMI file
                     # with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
