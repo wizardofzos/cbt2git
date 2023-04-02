@@ -42,12 +42,12 @@ parser.add_argument("--cbtfiles", type=str,
                     default=f'.cbtfiles',
                     help=f"""Full path to the cbtfiles. 
 This is all up-to-date zip files (if you ran --update).
-Defaults to '~/.cbtfiles""")
+Defaults to {os.getcwd()}/.cbtfiles""")
 
 parser.add_argument("--repos", type=str,
                     default=f'.cbtrepos',
                     help=f"""Full path to local repos folder. 
-Defaults to ~/stage""")
+Defaults to {os.getcwd()}/.cbtrepos""")
 
 parser.add_argument("--only", type=int,
                     default=0,
@@ -130,10 +130,16 @@ if args.clean:
     if not noremote:
         for repo in me.get_repos():
             if repo.name[:3] == "CBT":
-                print(f"Deleting {repo.name}", end=' ', flush=True)
+                rate_used, rate_init = github.rate_limiting
+                gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
+                print(f"Deleting {repo.name:8} (gracetime={gracetime}, ratelimits={rate_used}/{rate_init})", end=' ', flush=True)
                 r = me.get_repo(repo.name)
+                time.sleep(gracetime/3) 
                 r.delete()
-                print("🗑️", flush=True)
+                print(f" ", end='          \r', flush=True)
+
+print('')
+
 
 if not os.path.isdir(repos):
     os.mkdir(repos)
