@@ -1,5 +1,0 @@
-2023-04-01 11:56:32.254989 - Initialized conversion of CBT058
-2023-04-01 11:56:32.277177 - Received CBT.V504.FILE058.PDS from FILE058.XMI 
-2023-04-01 11:56:32.278187 - Found $$$#DATE.txt (text/plain) in CBT.V504.FILE058.PDS, moved to PDS/$$$#DATE
-2023-04-01 11:56:32.278963 - Found @FILE058.txt (text/plain) in CBT.V504.FILE058.PDS, moved to PDS/@FILE058
-2023-04-01 11:56:32.279955 - Found LINKLIST.txt (text/plain) in CBT.V504.FILE058.PDS, moved to PDS/LINKLIST
