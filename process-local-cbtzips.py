@@ -355,9 +355,9 @@ for i,z in enumerate(toprocess):
                 else:
                     ext = '.bin'
                 newmember = member.split('.')[0]                
-                if mimetype == 'text/plain':
+                if mimetype.split('/')[0] == 'text':
                     # we just copy this over inside our repopath
-                    # usssafe anyone :)
+                    # usssafe vai the single quotes :)
                     os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{pdsfolder}/{newmember}' > /dev/null 2>&1")
                     # add the ISPFSTATS 
                     if not member_info['ispf']:
@@ -381,7 +381,11 @@ for i,z in enumerate(toprocess):
                     newnestpds = '.'.join(nested_pdsfile.split('.')[-2:])
                     loglines.append(f'{datetime.datetime.now()} - Found {member}{member_info["extension"]} ({member_info["mimetype"]}) in {pdsfile}'+ '\n')
                     # move to correct spot
-                    os.system(f'mv {repopath}/{nested_pdsfile} {repopath}/{newnestpds} > /dev/null 2>&1')
+                    res = os.system(f'mv {repopath}/{nested_pdsfile} {repopath}/{newnestpds} > /dev/null 2>&1')
+                    if res != 0:
+                        # when PS not PDS, there's a .txt so we just redo?
+                        os.system(f'mv {repopath}/{nested_pdsfile}.txt {repopath}/{newnestpds} > /dev/null 2>&1')
+
                     newxmi = repopath + "/" + member + ext
                     # add nested XMI to root of repo
                     os.system(f'cp /tmp/{pdsfile}/{member}{ext} {newxmi} > /dev/null 2>&1')
@@ -408,7 +412,7 @@ for i,z in enumerate(toprocess):
                         
                     if 'COPYR1' in nested_xmijson:
                         # FOR A PDS...
-                        print("NESTED PDS IN XMI XMI????")
+                        print("NESTED PDS IN XMI XMI???? NEVER HAPPENS...")
                         1/0
                         for m in nested_xmijson['file'][nested_xmi_file]['members']:
                             print(f"Calling ditzigispf for {m} {nested_xmijson['file'][nested_xmi_file]['members'][m]['ispf']}")
