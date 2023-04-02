@@ -539,17 +539,20 @@ for i,z in enumerate(toprocess):
                         xmipds.write(f"# +-------------------------------------------------------+" + "\n")
 
                 else:
-                    loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {reponame}/{member}{ext}'+ '\n')
-                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}{ext}' > /dev/null 2>&1") # as replaced with the XMI file
-                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                                xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                                xmipds.write(f"# |{'AN UNSUPPORTED MIME-TYPE'.center(55)}" + "|\n")
-                                xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                                xmipds.write(f"# |{'XMI data STORED AS'.center(55)}" + "|\n")
-                                place = f'{reponame}/{member}.xmi'
-                                xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                    loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {mainpds}/{member}'+ '\n')
+                    res = os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{pdsfolder}/{member}' > /dev/null 2>&1") # as replaced with the XMI file
+                    print(res)
+                    # loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {reponame}/{member}{ext}'+ '\n')
+                    # os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}{ext}' > /dev/null 2>&1") # as replaced with the XMI file
+                    # with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
+                    #             xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+                    #             xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
+                    #             xmipds.write(f"# |{'AN UNSUPPORTED MIME-TYPE'.center(55)}" + "|\n")
+                    #             xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
+                    #             xmipds.write(f"# |{'XMI data STORED AS'.center(55)}" + "|\n")
+                    #             place = f'{reponame}/{member}.xmi'
+                    #             xmipds.write(f"# |{place.center(55)}" + "|\n") 
+                    #             xmipds.write(f"# +-------------------------------------------------------+" + "\n")
 
 
             # Also get the @FILEnnn into README
