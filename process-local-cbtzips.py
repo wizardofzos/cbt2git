@@ -540,7 +540,7 @@ for i,z in enumerate(toprocess):
 
                 else:
                     loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {reponame}/{member}{ext}'+ '\n')
-                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}.xmi' > /dev/null 2>&1") # as replaced with the XMI file
+                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}{ext}' > /dev/null 2>&1") # as replaced with the XMI file
                     with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
                                 xmipds.write(f"# +-------------------------------------------------------+" + "\n")
                                 xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
