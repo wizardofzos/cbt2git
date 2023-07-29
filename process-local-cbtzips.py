@@ -134,7 +134,7 @@ if args.clean:
                 gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
                 print(f"Deleting {repo.name:8} (gracetime={gracetime}, ratelimits={rate_used}/{rate_init})", end=' ', flush=True)
                 r = me.get_repo(repo.name)
-                time.sleep(gracetime/3) 
+                time.sleep(gracetime/6) 
                 r.delete()
                 print(f" ", end='          \r', flush=True)
 
