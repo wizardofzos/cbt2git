@@ -92,6 +92,7 @@ fulllog = []
 # No store user/pass in scripts lol
 # Get token via https://github.com/settings/tokens/
 # testing with GITHUB_TOKEN="6"
+
 with open('config.yml', 'r') as f:
     config = yaml.safe_load(f)
 
@@ -128,15 +129,21 @@ if args.clean:
     os.system(f'rm -rf {cbtfiles}/*')
     os.system(f'rm -rf {repos}/*')
     if not noremote:
-        for repo in me.get_repos():
-            if repo.name[:3] == "CBT":
-                rate_used, rate_init = github.rate_limiting
-                gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
-                print(f"Deleting {repo.name:8} (gracetime={gracetime}, ratelimits={rate_used}/{rate_init})", end=' ', flush=True)
-                r = me.get_repo(repo.name)
-                time.sleep(gracetime/6) 
-                r.delete()
-                print(f" ", end='          \r', flush=True)
+        print(f"{me.get_repos().totalCount} Repos ...")
+        while me.get_repos().totalCount > 1:
+            # Let's leave the discuss repo but remove all the rest...
+            for repo in me.get_repos():
+                if repo.name[:3] == "CBT":
+                    rate_used, rate_init = github.rate_limiting
+                    gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
+                    print(f"Deleting {repo.name:8} (gracetime={gracetime}, ratelimits={rate_used}/{rate_init})", end=' ', flush=True)
+                    r = me.get_repo(repo.name)
+                    #time.sleep(gracetime/24) 
+                    try:
+                        r.delete()
+                    except:
+                        print('Error????')
+                    print(f" ", end='          \r', flush=True)
 
 print('')
 
@@ -620,7 +627,9 @@ for i,z in enumerate(toprocess):
                         with open(logfile, 'w') as biglog:
                             biglog.writelines(fulllog)
                         # then sleep for long, so I get to keep this running unattended!
-                        time.sleep(1800)
+                        time.sleep(600)
+                        continue
+
                     # sleep a bit....... github seems to lag on creation?
                     time.sleep(10) # just to be sure :)
                     repourl = f'git@github.com:cbttape/{reponame}.git' 
@@ -631,16 +640,17 @@ for i,z in enumerate(toprocess):
                 # repo was there, we can justpush our updates
                 os.system(f'cd {repopath} && git push origin main --quiet')
                 rate_used, rate_init = github.rate_limiting
-                # print(f"Rate critical? ({rate_used}/{rate_init})")
                 gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
+                print(f"Rate critical? ({rate_used}/{rate_init}), gracetime={gracetime}")
                 if gracetime > 0:
-                    # print(f'Sleep for trice the grace time...{gracetime*3} secs')
-                    time.sleep(gracetime*3)
-                # and wait another minute (we're not in a rush :) )
+                    print(f'Sleep for twice the grace time...{gracetime*2} secs')
+                    time.sleep(gracetime*2)
+                
                 if i % 10 == 0 and only == 0:
                     # every 10, and not if we running just one...
-                    # print("Sleep another minute every 10 repos...")
-                    time.sleep(60)
+                    # print("Sleep another 30secs every 10 repos...")
+                    print("sleep for 30...")
+                    time.sleep(30)
     # add log from this conersion to main full log
     fulllog += loglines
     # cleanup /tmp stuff
