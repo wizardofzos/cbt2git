@@ -46,14 +46,8 @@ import subprocess
 # FILE063	ERROR	ERROR	ERROR	ERROR
 
 
-parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, description="""Create, or update a GitHub profile with data from CBTTape.org.
-
-    1. Step One: Extract all CBTTapes and create GitHub Repo if needed.
-       Process all files that were downloaded from cbttape.org. All the zipfiles stored in the path you specify with --stage. are processed. They are copied to the --cbtrepos folder if
-they're new. If they're the same as  what's already present there, nothing happens :) Otherwise, they're new a repote repo
-at GITHUB_NAME_OR_ORG from config.yaml will be created.
-Zip files are expaned to their containing PDS/SEQ. This PDS will be scanned, nested XMIT files will be expanded into the repo too.
-Binary files that do not resolve to a (paritioned) sequential file will be stored as a new xmit in the /xmits folder.""")
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, description="""Create some analytics on CBT tape files. Very much needed to get the code working for all types.
+Very much wanted for insights and nice xlsx-es. Can read the pickle file from get-cbttapes-locally.py so don't need to parse site data again. Also updataes the pickle file :)""")
 
 parser.add_argument("--stage", type=str,
                     default=f'{os.getcwd()}/stage',
@@ -245,4 +239,4 @@ else:
 xlsx = 'cbt.xlsx'
 writer = pd.ExcelWriter(f'{xlsx}', engine='xlsxwriter')
 cbt.to_excel(writer, sheet_name='CBTTAPES', index=False)
-writer.save()
+writer.close()
