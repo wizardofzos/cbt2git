@@ -20,19 +20,137 @@ import logging
 import filecmp
 import shutil
 
-# Setup logging
-logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
-logging.basicConfig(filename=logfile, encoding='utf-8', level=logging.INFO)
+# for testing purposes lol
+DIR = '/Users/alisonzhang/Desktop/cs4442/tmp/'
+docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf', 
+                            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                            'application/vnd.oasis.opendocument.text','application/vnd.oasis.opendocument.text',
+                            'application/vnd.ms-powerpoint','application/vnd.ms-excel',
+                            'application/vnd.openxmlformats-officedocument.presentationml.presentation']
 
 class XMIObject:
-    def __init__(self, xmi_json):
-        self.data = xmi_json
-        self.pdsfile = list(xmi_json['file'].keys())[0]
-        self.type = xmi_json['file'][self.pdsfile]['COPYR1']['type']
-        self.members = xmi_json['file'][self.pdsfile]['members']
+    def __init__(self, xmi_file, repopath):
+        os.makedirs(repopath , exist_ok = True) # Create target directory
+        self.xmi_file = xmi_file
+        self.repopath = repopath
+        self.xmi_json = self.extract_xmi()
 
-        #for key, value in self.data.items():
-        #    setattr(self, key, value)
+        if self.xmi_json:
+            # Set attributes from json file
+            self._set_attributes()        
+
+    def extract_xmi(self):
+        """Opens the XMI file and extracts its contents as JSON."""
+        try:
+            xmi_obj = xmi.open_file(self.xmi_file, quiet=True)
+        except Exception as e:
+            print(f"Error opening {self.xmi_file}: {str(e)}")
+            return
+        
+        xmi_obj = xmi.open_file(self.xmi_file, quiet = True)
+        xmi_obj.set_output_folder(DIR)
+        xmi_obj.set_quiet(True)
+        try:
+            xmi_obj.extract_all()
+        except Exception as e:
+            print(f"Error extracting {self.xmi_file}: {str(e)}")
+            return
+        
+        # Check if contents are empty 
+        try:
+            if not xmi.list_all(self.xmi_file):
+                # Empty or invalid XMI
+                print(f"XMI file {self.xmi_file} is empty or invalid.")
+                return
+
+        except Exception as e:
+            # Log an error if the file is not a valid XMI file
+            print(f"Error processing {self.xmi_file} from ZIP file {zip}: {str(e)}")
+            return
+        
+        return json.loads(xmi_obj.get_json())
+    
+    def _set_attributes(self):
+        for key, value in self.xmi_json.items():
+            if (key == 'file'): 
+                file = list(value.keys())[0]
+                file_info = value[file]
+                
+                if file_info.get('COPYR1'):
+                    # Check if XMI is a PDS
+                    self.members = {} # Create dict to store PDS members
+                    os.makedirs(f'{self.repopath}/PDS' , exist_ok = True)
+                    self.file = f'{DIR}{file}'
+
+                    for k, v in file_info.items():
+                        if (k == 'members'):
+                            # Add each member as a child XMIObject
+                            for name, data in v.items():
+                                if (data.get('mimetype') == 'application/xmit'):
+                                    # Create new XMIObject if member is an xmi file 
+                                    self.members[name] = XMIObject(f'{DIR}{file}/{name}.xmi', f'{self.repopath}/{name}')
+                                # Non-XMI members 
+                                self.members[name] = XMIMember(data, name, self, True)
+
+                        else:
+                            setattr(self, k, v) 
+                else:
+                    # For non-PDS XMI's
+                    self.file = f'{DIR}'
+                    self.member = XMIMember(file_info, self, False)
+
+            else:
+                setattr(self, key, value)
+
+class XMIMember:
+    def __init__(self, member_info, name, parent, in_pds):
+        self.name = name
+        self.parent = parent
+        for key, value in member_info.items():
+            setattr(self, key, value)
+        
+        # Set defaults if missing
+        setattr(self, 'mimetype', getattr(self, 'mimetype', 'application/octet-stream'))
+        setattr(self, 'extension', getattr(self, 'extension', '.bin'))
+
+        self.copy_file(in_pds)
+
+    def copy_file(self, in_pds):
+        src_dir = self.parent.file
+        dst_dir = self.parent.repopath
+
+        if self.mimetype.split('/')[0] == 'text' or self.mimetype == 'application/xmit':
+            # Copy to new location if text file
+            # Set source/destination of file for copying 
+            src = f'{src_dir}/{self.name}{self.extension}'
+            if in_pds:
+                # Check if in PDS subdirectory 
+                dst = f'{dst_dir}/PDS/{self.name}'
+            else:
+                dst = f'{dst_dir}/{self.name}'
+
+            if not os.path.exists(dst) or not filecmp.cmp(src, dst):
+                shutil.copyfile(src, dst)
+
+            # Set ISPFSTATS
+            setattr(self, 'ispf', getattr(self, 'ispf', 
+                                          {'version': '01.00', 'flags': 0, 'createdate': '1976-06-12T00:00:00.000000', 
+                                           'modifydate': '1976-06-12T22:18:12.000000', 'lines': 0, 'newlines': 0, 
+                                           'modlines': 0, 'user': 'CBT2GIT'}))
+            
+            #print(f'{datetime.datetime.now()} - Found {src}, moved to {dst}' + '\n')
+
+        elif self.mimetype in docmimetypes:
+            # Doc types
+            os.makedirs(f'{dst_dir}/docs' , exist_ok = True) # Create directory for docs 
+            src = f'{src_dir}/{self.name}{self.extension}'
+            dst = f'{dst_dir}/docs/{self.name}{self.extension}'
+
+            if not os.path.exists(dst) or not filecmp.cmp(src, dst):
+                shutil.copyfile(src, dst)
+        
+        elif self.mimetype == 'application/zip':
+            print(self.name)
 
 def parse_arguments():
     """Parse all arguments."""
@@ -70,60 +188,6 @@ def parse_arguments():
     args = parser.parse_args()
     return args
 
-def github_login(github):
-    with open('config.yml', 'r') as f:
-        config = yaml.safe_load(f)
-    me = github.get_user()
-
-    try:
-        GITHUB_USER = me.login
-        print(f"Token has logged onto {me.name} acting in github user github.com/{GITHUB_USER}")
-    except Exception as e:
-        print(f"Error logging into {me}: {e}")
-        exit(4)
-
-def clean_remote_repos():
-    """Removes remote repositories."""
-    repos = list(github.get_user().get_repos())
-    total_repos = len(repos)
-
-    # Check if there are any repos to process
-    if total_repos == 0:
-        print("No repositories to delete.")
-        return
-    
-    print(f"Total Repos: {total_repos}")
-
-    while total_repos > 0:
-        for repo in repos:
-            if repo.name[:3] == "CBT":
-                rate_used, rate_init = github.rate_limiting
-                gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
-                print(f"Deleting {repo.name:8} (gracetime = {gracetime}, ratelimits = {rate_used}/{rate_init})", end=' ', flush=True)
-                
-                try:
-                    repo.delete()
-                    # Update the repo list/total count after deletion
-                    repos.remove(repo)
-                    total_repos -= 1
-                except Exception as e:
-                    print(f"Error deleting {repo.name}: {e}")
-                
-                # Check if close to hitting the rate limit 
-                if rate_used >= rate_init * 0.9:  
-                    time_to_wait = gracetime
-                    print(f"\nRate limit reached, waiting for {time_to_wait:.2f}s...")
-                    time.sleep(time_to_wait + 1)  
-                
-                print(f"Deleted {repo.name}       ", end='\r', flush=True)
-
-            # Ignore non-CBT repos
-            else:
-                repos.remove(repo)
-                total_repos -= 1
-    
-    print("\nFinished deleting CBT repositories.")
-
 def copy_CBT_file(filename):
     """ Copies CBT file to cbtfiles repo if new or different.""" 
     src = os.path.join(stage, filename)
@@ -138,74 +202,29 @@ def copy_CBT_file(filename):
         logging.exception(f"{src} not found.")
         if only:
             exit(4)
-    
-def extract_xmi_json(zip):
-    zip_ref = zipfile.ZipFile(zip, 'r')
 
+def unzip_xmi(zip):
+    """Unzips zip file containing xmi"""
+    try:
+        zip_ref = zipfile.ZipFile(zip, 'r')
+    except:
+        print(f"ZIP {zip} is not a zip file.")
+        return
+    
     info = zip_ref.infolist()
 
     if len(info) == 0:
-        logging.exception(f"No files found in ZIP {zip}")
+        print(f"No files found in ZIP {zip}")
         return
 
     if len(info) > 1:
-        logging.exception(f"More than one file in zip {zip} => {', '.join([file.filename for file in info])}")
+        print(f"More than one file in zip {zip} => {', '.join([file.filename for file in info])}")
         return
 
-    zip_ref.extractall('/tmp')
-    # Return xmi filename
-
-    xmi_file = f"/tmp/{info[0].filename}"
-    try:
-        contents = xmi.list_all(xmi_file)
-
-        if not contents:
-            # Empty or invalid XMI
-            logging.exception(f"XMI file {xmi_file} is empty or invalid.")
-            return
-    except Exception as e:
-        # Log an error if the file is not a valid XMI file
-        logging.exception(f"Error processing {xmi_file} from ZIP file {zip}: {str(e)}")
-        return
+    zip_ref.extractall(DIR)
+    xmi_file = f'{DIR}{info[0].filename}'
     
-    try:
-        xmi_obj = xmi.open_file(xmi_file, quiet=True)
-    except Exception as e:
-        logging.exception(f"Error opening {xmi_file}: {str(e)}")
-        return
-
-    xmi_obj.set_output_folder('/tmp')
-    xmi_obj.set_quiet(True)
-
-    try:
-        xmi_obj.extract_all()
-    except Exception as e:
-        logging.exception(f"Error extracting {xmi_file}: {str(e)}")
-        return
-    
-    # Return xmi json
-    return json.loads(xmi_obj.get_json())
-
-def remove_extensions(repopath):
-    for f in glob.glob(f'{repopath}/*'):
-        path, file = os.path.split(f)
-        
-        # Split the filename by the last dot to handle extensions properly
-        newfile = file.rsplit('.', 1)[0]  # Keeps everything before the last dot
-
-        # Construct the new file path
-        noext = os.path.join(path, newfile)
-
-        # Escape dollar signs
-        f = f.replace('$', r'\$')
-        noext = noext.replace('$', r'\$')
-
-        # Move the file using shutil
-        try:
-            shutil.move(f, noext)
-        except Exception as e:
-            logging.exception(f"Error moving file {f}: {e}")
-
+    return xmi_file # return unzipped xmi filename
 
 def main():
     # Parse arguments
@@ -219,24 +238,6 @@ def main():
     cbtfiles = args.cbtfiles
     noremote = args.noremote
 
-    # Log into GitHub using token in config.yml
-    global github
-    if not noremote:
-        with open('config.yml', 'r') as f:
-            config = yaml.safe_load(f)
-
-        github = Github(config['token'])
-        github_login(github)
-    else:
-        logging.info("Running locally only, no updates to GitHub.")
-    
-    # Clean local/remote repositories 
-    if args.clean:
-        os.system(f'rm -rf {cbtfiles}/*')
-        os.system(f'rm -rf {repos}/*')
-        if not noremote:
-            clean_remote_repos()
-    
     # Create repo/cbtfile directory if they don't exist
     os.makedirs(repos, exist_ok = True)
     os.makedirs(cbtfiles, exist_ok = True)
@@ -261,8 +262,8 @@ def main():
             toprocess.append(dst)
     
     print(f"Need to process {len(toprocess)} CBT zips.")
-
     toprocess = sorted(toprocess)
+
     for index, zip in enumerate(toprocess):
         pct = math.floor((index/len(toprocess))*100) 
         done = math.floor((pct/100)*40)
@@ -272,113 +273,22 @@ def main():
         print(f'{done}{todo} {zip} ({pct}%)', end='\r', flush=True)
 
         cbtnum = zip.split('/CBT')[1].split('.')[0]
-        logging.info(f'{datetime.datetime.now()} - Initialized conversion of CBT{cbtnum}.')
-
-        xmi_json = extract_xmi_json(zip)
-        # Skip file if unable to extract xmi json 
-        if not xmi_json:
+        print(f'{datetime.datetime.now()} - Initialized conversion of CBT{cbtnum}.')
+        xmi_file = f'{DIR}FILE{cbtnum}.XMI'
+        xmi_file = unzip_xmi(zip)
+        # Skip file if unable to unzip 
+        if not xmi_file:
             continue
 
-        xmi_object = XMIObject(xmi_json)
-
-        # Skip if XMI is not a PDS
-        if xmi_object.type != 'PDS':
-            logging.info(f"{datetime.datetime.now()} - No PDS in CBTNUM{cbtnum}.")
+        if os.path.exists(xmi_file):
+            # Set reponame for each file 
+            reponame = zip.split('/')[1].split('.')[0]
+            repopath = f'{repos}/{reponame}'
+            # Exract XMI to new repo 
+            myXMI = XMIObject(xmi_file, repopath)
+    
+        else:
             continue
-
-        pdsfile = xmi_object.pdsfile
-        logging.info(f'{datetime.datetime.now()} - Received {pdsfile} from CBT{cbtnum}.XMI')
-
-        # Create new repo to do... something 
-        repopath = repos + "/CBT" + cbtnum
-        os.makedirs(repopath, exist_ok = True)
-        # Create target PDS folder
-        pdsfolder = repopath + "/pdsfile"
-        os.makedirs(pdsfolder, exist_ok = True)
-
-        members = xmi_object.members
-        # Do something with the PDS file here... not really sure what's going on
-        for member in members:
-            member_info = members[member]
-
-            # Detect mimetype 
-            if 'mimetype' in member_info:
-                mimetype = member_info['mimetype']
-            else:
-                mimetype = 'application/octet-stream' # PDS? 
-            
-            # Detect file type? 
-            if 'extension' in member_info:
-                ext = member_info['extension']
-            else:
-                ext = '.bin'
-            
-            src_file = f"/tmp/{pdsfile}/{member}{ext}"
-
-            # text file 
-            if mimetype.split('/')[0] == 'text':
-                dst_file = f"{pdsfolder}/{member}"
-
-                # Copy text files into repopath
-                try:
-                    shutil.copy2(src_file, dst_file)
-                except Exception as e:
-                    logging.exception(f"Error copying file {member}{ext}: {e}")
-                
-                member_info['ispf'] = member_info.get('ispf', 
-                                                      {'version': '01.00',
-                                                       'flags': 0,
-                                                       'createdate': '1976-06-12T00:00:00.000000',
-                                                       'modifydate': '1976-06-12T22:18:12.000000',
-                                                       'lines': 0,
-                                                       'newlines': 0,
-                                                       'modlines': 0,
-                                                       'user': 'CBT2GIT'})
-                
-                logging.info(f'{datetime.datetime.now()} - Found {member}{ext} in {pdsfile}, moved to {dst_file}')
-
-            # nexted xmi? 
-            elif mimetype == 'application/xmit':
-                # I can prb add this part to a separate function... 
-                nested_content = xmi.list_all(src_file)
-                try:
-                    nested_xmi_obj = xmi.open_file(src_file, quiet=True)
-                except Exception as e:
-                    logging.exception(f"Error opening {src_file}: {str(e)}")
-                    return
-
-                nested_xmi_obj.set_output_folder(f'{repopath}')
-                nested_xmi_obj.set_quiet(True)
-
-                try:
-                    nested_xmi_obj.extract_all()
-                except Exception as e:
-                    logging.exception(f"Error extracting {src_file}: {str(e)}")
-                    return
-                
-                # Not really sure why it's called this... 
-                src_path  = f"{repopath}/{nested_content[0].split('(')[0]}"
-                dst_path = f"{repopath}/{'.'.join(src_path.split('.')[-2:])}"
-
-                # Append .txt to end if not a PDS (honestly there's prb a better way to do this)
-                if not os.path.exists(src_path):
-                    src_path += '.txt'
-                
-                # Move to correct place
-                try:
-                    shutil.move(src_path, dst_path)
-                except Exception as e:
-                    logging.exception(f"Error moving file {src_path}: {e}")
-                
-                # Add nested XMI to root of repo
-                dst_file = repopath + "/" + member + ext
-                try:
-                    shutil.copy2(src_file, dst_file)  # Copy the file
-                except Exception as e:
-                    logging.exception(f"Error copying file {member}{ext}: {e}")
-                
-                remove_extensions(dst_path)
 
 if __name__ == '__main__':
     main()
-
