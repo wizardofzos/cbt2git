@@ -15,7 +15,7 @@ import shlex
 import argparse 
 import subprocess 
 import pprint
-from github import Github
+from github import Github, GithubException
 import logging
 import filecmp
 import shutil
@@ -222,19 +222,7 @@ def parse_arguments():
     args = parser.parse_args()
     return args
 
-def github_login(github):
-    with open('config.yml', 'r') as f:
-        config = yaml.safe_load(f)
-    me = github.get_user()
-
-    try:
-        GITHUB_USER = me.login
-        print(f"Token has logged onto {me.name} acting in github user github.com/{GITHUB_USER}")
-    except Exception as e:
-        print(f"Error logging into {me}: {e}")
-        exit(4)
-
-def clean_repos():
+def clean_repos(github):
     """Removes remote repositories."""
     repos = list(github.get_user().get_repos())
     total_repos = len(repos)
@@ -338,6 +326,112 @@ def extract_xmi(zip):
 
     myXMI = XMIObject(xmi_file, repopath)
 
+def get_github_token():
+    try:
+        with open('config.yml', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        token = config.get('token')
+        if not token:
+            print("Error: GitHub token not found in config.yml")
+            exit(4)
+
+        github = Github(token)
+        return github
+            
+    except Exception as e:
+        print(f"Unexpected error getting GithubToken: {e}")
+        exit(4)
+
+def create_git_repo(github, reponame):
+    me = github.get_user()
+    user = me.login
+
+    try:
+        # Try to get repourl and return if it exists
+        repourl = me.get_repo(reponame).ssh_url
+        print(f"Repo {reponame} already exists.")
+        return repourl
+    
+    except GithubException as e:
+        # If repository does not exist, create a new one
+        if e.status == 404:
+            print(f"Repo {reponame} does not exist, creating now.")
+        else:
+            print(f"An error occurred: {e}")
+            return 
+
+    # Create the new repository
+    try:
+        new_repo = me.create_repo(reponame)
+        print(f"Repository {reponame} created. SSH URL: {new_repo.ssh_url}")
+        return new_repo.ssh_url
+    except Exception as e:
+        print(f"Error creating github repo {reponame}: {e}")
+        time.sleep(600)
+        return
+
+def update_git_repo(github, reponame, remote_name="origin", branch="master"):
+    repourl = create_git_repo(github, reponame)
+    if not repourl:
+        return
+
+    repopath = f'{repos}/{reponame}'
+
+    # Create README file 
+    files  = glob.glob(f'{repopath}/PDS/@FIL*')
+    if len(files) != 1:
+        readme_content = 'echo "No @FILE in PDS"'
+        print(f"No @FIL(E) detected for {reponame}, creating a README.md without extra info.")
+    else:
+        readme_content = f'cat {files[0]}'
+
+    readme = f"""# {reponame} 
+    Converted to GitHub via [cbt2git](https://github.com/wizardofzos/cbt2git)
+
+    This is still a work in progress. GitHub repos will be deleted and created during this period...
+    ~~~~~~~~~~~~~~~~
+    {readme_content}
+    ~~~~~~~~~~~~~~~~
+    """
+
+    # Write to README.md
+    with open(f"{repopath}/README.md", "w") as file:
+        file.write(readme)
+        
+    try:
+        # Ensure repository is initialized
+        if not os.path.isdir(os.path.join(repopath, ".git")):
+            print("Initializing new Git repository...")
+            subprocess.run(["git", "init"], cwd=repopath, check=True)
+
+        # Check if remote already exists
+        remotes = subprocess.run(["git", "remote"], cwd=repopath, capture_output=True, text=True)
+        if remote_name not in remotes.stdout.split():
+            subprocess.run(["git", "remote", "add", remote_name, repourl], cwd=repopath, check=True)
+            print(f"Remote '{remote_name}' added: {repourl}")
+
+        # Check if there are changes to commit
+        git_status = subprocess.run(["git", "status", "--porcelain"], cwd=repopath, capture_output=True, text=True)
+        if not git_status.stdout.strip():
+            print("No changes to commit.")
+            return
+
+        # Stage all changes
+        subprocess.run(["git", "add", "."], cwd=repopath, check=True)
+
+        # Commit changes
+        #commit_message = f'Updates from cbttape.org ({datetime.datetime.now().strftime("%Y-%m-%d")})'
+        commit_message = 'test'
+        subprocess.run(["git", "commit", "-m", commit_message, "--quiet"], cwd=repopath, check=True)
+        print("Changes committed successfully.")
+
+        # Push changes
+        subprocess.run(["git", "push", remote_name, branch], cwd=repopath, check=True)
+        print(f"Changes pushed to {remote_name}/{branch} successfully.")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Error running Git command: {e}")
 
 def main():
     global repos, stage, only, cbtfiles, noremote
@@ -350,13 +444,16 @@ def main():
     cbtfiles = args.cbtfiles
     noremote = args.noremote
 
-    if not noremote:
-        global github
-        with open('config.yml', 'r') as f:
-            config = yaml.safe_load(f)
+    if not noremote:    
+        github = get_github_token()
+        try:
+            me = github.get_user()
+            user = me.login
+            print(f"Token has logged onto {me.name} acting in GitHub user github.com/{user}")
+        except Exception as e:
+            print(f"Unable to log into GitHub: {e}")
+            exit(4)
 
-        github = Github(config['token'])
-        github_login(github)
     else:
         print("Running locally only, no updates to GitHub.")
     
@@ -365,7 +462,7 @@ def main():
         os.system(f'rm -rf {cbtfiles}/*')
         os.system(f'rm -rf {repos}/*')
         if not noremote:
-            clean_repos()
+            clean_repos(github)
     
     # Create repo/cbtfile directory if they don't exist
     os.makedirs(repos, exist_ok = True)
@@ -395,6 +492,26 @@ def main():
         thread = threading.Thread(target=extract_xmi, args=(zip, ))
         thread.start()
         threads.append(thread)
+
+    if not noremote:
+        my_repos = sorted(os.listdir(repos)) # list of CBT repos
+        threads = []
+
+        for index, reponame in enumerate(my_repos):
+            pct = math.floor((index / len(my_repos)) * 100)
+            done = math.floor((pct / 100) * 40)
+            todo = 40 - done
+            done_bar = "✅" * done
+            todo_bar = "🟩" * todo
+
+            print(f'{done_bar}{todo_bar} {zip} ({pct}%) [updating, active threads={threading.active_count()}]', end='\r', flush=True)
+            while threading.active_count() >= MAX_THREAD_DOWNLOADS + 1:  # +1 for the main thread
+                time.sleep(0.5)
+
+            # Create new repo if missing, and commit any updates
+            thread = threading.Thread(target=update_git_repo, args=(github, reponame))
+            thread.start()
+            threads.append(thread)
 
 if __name__ == '__main__':
     main()
