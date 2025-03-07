@@ -224,8 +224,8 @@ def parse_arguments():
 
 def clean_repos(github):
     """Removes remote repositories."""
-    repos = list(github.get_user().get_repos())
-    total_repos = len(repos)
+    git_repos = list(github.get_user().get_repos())
+    total_repos = len(git_repos)
 
     # Check if there are any repos to process
     if total_repos == 0:
@@ -235,7 +235,7 @@ def clean_repos(github):
     print(f"Total Repos: {total_repos}")
 
     while total_repos > 0:
-        for repo in repos:
+        for repo in git_repos:
             if repo.name[:3] == "CBT":
                 rate_used, rate_init = github.rate_limiting
                 gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
@@ -244,7 +244,7 @@ def clean_repos(github):
                 try:
                     repo.delete()
                     # Update the repo list/total count after deletion
-                    repos.remove(repo)
+                    git_repos.remove(repo)
                     total_repos -= 1
                 except Exception as e:
                     logging.error(f"Error deleting {repo.name}: {e}")
@@ -259,7 +259,7 @@ def clean_repos(github):
 
             # Ignore non-CBT repos
             else:
-                repos.remove(repo)
+                git_repos.remove(repo)
                 total_repos -= 1
     
     print("\nFinished deleting CBT repositories.")
@@ -371,7 +371,7 @@ def create_git_repo(github, reponame):
         time.sleep(600)
         return
 
-def update_git_repo(github, reponame, remote_name="origin", branch="master"):
+def update_git_repo(github, reponame, remote_name="origin", branch="main"):
     repourl = create_git_repo(github, reponame)
     if not repourl:
         return
@@ -384,26 +384,27 @@ def update_git_repo(github, reponame, remote_name="origin", branch="master"):
         readme_content = 'echo "No @FILE in PDS"'
         print(f"No @FIL(E) detected for {reponame}, creating a README.md without extra info.")
     else:
-        readme_content = f'cat {files[0]}'
+        with open(files[0], 'r') as f:
+            readme_content = f.read()
+        readme_content = f"```\n{readme_content}\n```" # Wrap in code block to avoid problems with slashes... 
 
-    readme = f"""# {reponame} 
-    Converted to GitHub via [cbt2git](https://github.com/wizardofzos/cbt2git)
+    readme = f"""# {reponame}
+Converted to GitHub via [cbt2git](https://github.com/wizardofzos/cbt2git)
 
-    This is still a work in progress. GitHub repos will be deleted and created during this period...
-    ~~~~~~~~~~~~~~~~
-    {readme_content}
-    ~~~~~~~~~~~~~~~~
-    """
+This is still a work in progress. GitHub repos will be deleted and created during this period...
+
+{readme_content}
+"""
 
     # Write to README.md
     with open(f"{repopath}/README.md", "w") as file:
         file.write(readme)
-        
+
     try:
         # Ensure repository is initialized
         if not os.path.isdir(os.path.join(repopath, ".git")):
             print("Initializing new Git repository...")
-            subprocess.run(["git", "init"], cwd=repopath, check=True)
+            subprocess.run(["git", "init", "--initial-branch=main"], cwd=repopath, check=True)
 
         # Check if remote already exists
         remotes = subprocess.run(["git", "remote"], cwd=repopath, capture_output=True, text=True)
@@ -492,6 +493,8 @@ def main():
         thread = threading.Thread(target=extract_xmi, args=(zip, ))
         thread.start()
         threads.append(thread)
+
+    time.sleep(10) # Wait for threads to finish
 
     if not noremote:
         my_repos = sorted(os.listdir(repos)) # list of CBT repos
