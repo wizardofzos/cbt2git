@@ -36,9 +36,10 @@ logging.basicConfig(
 )
 
 class XMIObject:
-    def __init__(self, xmi_file, repopath):
+    def __init__(self, xmi_file, repopath, loglines=None):
         self.xmi_file = xmi_file
         self.repopath = repopath
+        self.loglines = loglines
         os.makedirs(repopath , exist_ok = True) # Create target directory
         self.xmi_json = self.extract_xmi() # Get json for XMI file 
 
@@ -73,7 +74,7 @@ class XMIObject:
             # Log an error if the file is not a valid XMI file
             logging.error(f"Error processing {self.xmi_file} from ZIP file {zip}: {str(e)}")
             return
-        
+    
         return json.loads(xmi_obj.get_json()) # Return the XMI json file 
 
     def _set_attributes(self):
@@ -92,13 +93,22 @@ class XMIObject:
                     # For non-PDS XMI's
                     self.content = ''
                     self.member = XMIMember(content, content_info, self)
+                    if (self.loglines):
+                        # Append to log if main CBT file 
+                        self.loglines.append(f'{datetime.datetime.now()} - Found {name}{extension} in {content}, moved to PDS/{name}' + '\n')
 
                 else:
                     # For XMI's with a PDS
                     self.PDS = True
                     self.members = {} # Create dict to store PDS members
+                    self.aliases = {} # Create dict to store aliases
                     os.makedirs(f'{self.repopath}/PDS' , exist_ok = True) # Create repo for PDS members
                     self.content = content # Set mainframe file name as attribute
+
+                    if (self.loglines):
+                        # Append to log if main CBT file 
+                        my_xmi = self.xmi_file.split('/')[-1]
+                        self.loglines.append(f'{datetime.datetime.now()} - Received {content} from {my_xmi} ' + '\n')
 
                     for k, v in content_info.items():
                         # Iterate through each item in content
@@ -109,12 +119,44 @@ class XMIObject:
                         else:
                             # Add each member as a child XMIObject
                              for name, data in v.items():
-                                # Get each member
+                                ttr = data.get('ttr')
+
+                                if (data.get('alias')):
+                                    # For aliases 
+                                    self.aliases[name] = ttr
+                                    continue 
+
+                                # For all members, create a new XMIMember 
+                                xmi_member = XMIMember(name, data, self)
+                                self.members[ttr] = xmi_member
+                                extension = getattr(xmi_member, 'extension', '')
+                                if (self.loglines):
+                                    # Append to log if main CBT file 
+                                    self.loglines.append(f'{datetime.datetime.now()} - Found {name}{extension} in {content}, moved to PDS/{name}' + '\n')
+                                
                                 if (data.get('mimetype') == 'application/xmit'):
                                     # Create new XMIObject if member is an xmi file 
-                                    self.members[name] = XMIObject(f'{DIR}{content}/{name}.xmi', f'{self.repopath}/{name}')
-                                # For all members, create a new XMIMember 
-                                self.members[name] = XMIMember(name, data, self)
+                                    self.members[ttr] = XMIObject(f'{DIR}{content}/{name}.xmi', f'{self.repopath}/{name}')
+                                    if (self.loglines):
+                                        # Append to log if main CBT file 
+                                        self.loglines.append(f'{datetime.datetime.now()} -   Received {name}.xmi to {name}' + '\n')
+                                
+                    # Deal with aliases
+                    for name, ttr in self.aliases.items():
+                        member = self.members[ttr] # Pointing to this member 
+                        if self.PDS:
+                            symlink = f'PDS/{name}'
+                        else:
+                            symlink = name
+                        os.symlink(member.name, f'{self.repopath}/{symlink}') # Create symlink
+                        if (self.loglines):
+                            # Append to log if main CBT file 
+                            self.loglines.append(f'{datetime.datetime.now()} - Found alias {name} to {member.name} in {content}, moved to {symlink}' + '\n')
+                    
+                # Write logfile
+                if (self.loglines):
+                    with open(f"{self.repopath}/cbt2git.log", "w") as file:
+                        file.writelines(self.loglines)
 
 class XMIMember:
     def __init__(self, name, data, parent):
@@ -129,7 +171,6 @@ class XMIMember:
         # Set defaults if missing
         setattr(self, 'mimetype', getattr(self, 'mimetype', 'application/octet-stream'))
         setattr(self, 'extension', getattr(self, 'extension', '.bin'))
-        # This doesn't work for 433/874/942/967... not sure what to do about that 
 
         self.move_file(hasattr(parent, 'PDS'))
 
@@ -163,28 +204,13 @@ class XMIMember:
                 # Just copy file if unable to unzip 
                 copy_file(src, dst)
         
-        elif self.mimetype == 'application/octet-stream':
-            # Copy with extension still present
-            if PDS:
-                copy_file(src, f'{dst_dir}/PDS/{self.name}{self.extension}')
-            else:
-                copy_file(src, f'{dst}{self.extension}')
-        
         else:
             # Copy without extension still present
             if PDS:
                 copy_file(src, f'{dst_dir}/PDS/{self.name}')
             else:
                 copy_file(src, dst)
-
-            if self.mimetype.split('/')[0] == 'text':
-                # Set ISPFSTATS for text types
-                setattr(self, 'ispf', getattr(self, 'ispf', 
-                                            {'version': '01.00', 'flags': 0, 'createdate': '1976-06-12T00:00:00.000000', 
-                                            'modifydate': '1976-06-12T22:18:12.000000', 'lines': 0, 'newlines': 0, 
-                                            'modlines': 0, 'user': 'CBT2GIT'}))
-
-
+    
 def parse_arguments():
     """Parse all arguments."""
     parser = argparse.ArgumentParser(formatter_class = argparse.RawTextHelpFormatter, 
@@ -264,7 +290,7 @@ def clean_repos(github):
     
     print("\nFinished deleting CBT repositories.")
 
-def copy_file(src, dst):
+def copy_file(src, dst): 
     """ Copies src to dst if new or different.""" 
     if os.path.isfile(src):
         if not os.path.exists(dst) or not filecmp.cmp(src, dst):
@@ -296,6 +322,10 @@ def files_to_process(flist):
     return sorted(to_process)
 
 def extract_xmi(zip):
+    loglines = []
+    cbtnum = zip.split('/CBT')[1].split('.')[0]
+    loglines.append(f'{datetime.datetime.now()} - Initialized conversion of CBT{cbtnum}' + '\n')
+
     try:
         zip_ref = zipfile.ZipFile(zip, 'r')
     except Exception as e: 
@@ -324,7 +354,7 @@ def extract_xmi(zip):
     reponame = zip.split('/')[1].split('.')[0]
     repopath = f'{repos}/{reponame}'
 
-    myXMI = XMIObject(xmi_file, repopath)
+    myXMI = XMIObject(xmi_file, repopath, loglines)
 
 def get_github_token():
     try:
@@ -399,6 +429,23 @@ This is still a work in progress. GitHub repos will be deleted and created durin
     # Write to README.md
     with open(f"{repopath}/README.md", "w") as file:
         file.write(readme)
+
+    # Create .gitattributes file 
+        attributes=f"""*                git-encoding=iso8859-1 zos-working-tree-encoding=ibm-1047 
+.gitattributes    git-encoding=iso8859-1 zos-working-tree-encoding=iso8859-1
+.gitignore        git-encoding=iso8859-1 zos-working-tree-encoding=iso8859-1
+*.docm binary
+*.docx binary
+*.doc  binary
+*.pdf  binary
+*.epub binary
+*.mobi binary
+*.azw3 binary
+*.pdf binary"""
+
+    # Write to README.md
+    with open(f"{repopath}/.gitattributes", "w") as file:
+        file.write(attributes)
 
     try:
         # Ensure repository is initialized
@@ -484,7 +531,6 @@ def main():
         done_bar = "✅" * done
         todo_bar = "🟩" * todo
 
-        cbtnum = zip.split('/CBT')[1].split('.')[0]
         print(f'{done_bar}{todo_bar} {zip} ({pct}%) [converting, active threads={threading.active_count()}]', end='\r', flush=True)
         while threading.active_count() >= MAX_THREAD_DOWNLOADS + 1:  # +1 for the main thread
             time.sleep(0.5)
@@ -494,13 +540,20 @@ def main():
         thread.start()
         threads.append(thread)
 
-    time.sleep(10) # Wait for threads to finish
+    time.sleep(20) # Wait for threads to finish
 
     if not noremote:
         my_repos = sorted(os.listdir(repos)) # list of CBT repos
         threads = []
 
         for index, reponame in enumerate(my_repos):
+            if only:
+                if reponame != only:
+                    continue 
+            
+            if reponame[:3] != "CBT":
+                continue
+
             pct = math.floor((index / len(my_repos)) * 100)
             done = math.floor((pct / 100) * 40)
             todo = 40 - done
