@@ -16,200 +16,177 @@ import argparse
 import subprocess 
 import pprint
 from github import Github, GithubException
-import logging
 import filecmp
 import shutil
 import threading
+import random
+import requests
+import logging
+
 
 MAX_THREAD_DOWNLOADS = 15
-DIR = '/Users/alisonzhang/Desktop/cs4442/tmp/'
-docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf', 
-                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                'application/vnd.oasis.opendocument.text','application/vnd.oasis.opendocument.text',
-                'application/vnd.ms-powerpoint','application/vnd.ms-excel',
-                'application/vnd.openxmlformats-officedocument.presentationml.presentation']
 
-# Configure logging to write to a file
+# Logging info 
+log_buffer = io.StringIO()
 logging.basicConfig(
-    filename='file_check.log',  
-    level=logging.INFO       
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(log_buffer)]
 )
 
 class XMIObject:
-    def __init__(self, xmi_file, repopath, loglines=None):
-        self.xmi_file = xmi_file
+    def __init__(self, xmi_file, repopath, parent = None):
+        self.xmi_file = xmi_file 
+        name = xmi_file.split('/')[-1]
         self.repopath = repopath
-        self.loglines = loglines
         os.makedirs(repopath , exist_ok = True) # Create target directory
-        self.xmi_json = self.extract_xmi() # Get json for XMI file 
 
-        if self.xmi_json:
-            # Set attributes from json file if it exists
-            self._set_attributes()   
-    
-    def extract_xmi(self):
-        """Opens the XMI file and extracts its contents as JSON."""
+        self.xmi_obj = self.open_xmi()
+        if not self.xmi_obj:
+            return
+        self.pds = self.xmi_obj.get_file()
+
+        self.loglines = []
+        self.loglines.append(f'{datetime.datetime.now()} - Received {self.pds} from {name} ' + '\n')
+
+        if (self.xmi_obj.is_pds(self.pds)):
+            # if the file is a PDS, set members as new XMIMembers
+            self.has_pds = True
+            self.set_members() 
+
+            if not parent:
+                with open(f"{self.repopath}/cbt2git.log", "w") as file:
+                    file.writelines(self.loglines)
+            else:
+                parent.loglines.append(str(self.loglines))
+
+        else:
+            # add the file as the only member
+            filename = self.pds
+            info = self.xmi_obj.get_file_info_simple(filename)
+            self.pds = ''
+            XMIMember(filename, info, self)
+
+    def open_xmi(self):
+        """Opens the XMI file and extracts its contents."""
         try:
             xmi_obj = xmi.open_file(self.xmi_file, quiet = True)
         except Exception as e:
-            logging.error(f"Error opening {self.xmi_file}: {str(e)}")
-            return
+            logging.error(f"{datetime.datetime.now()} - Error opening {self.xmi_file}: {str(e)}")
+            return None
 
-        xmi_obj.set_output_folder(DIR)
+        xmi_obj.set_output_folder('/tmp')
         xmi_obj.set_quiet(True)
+
         try:
             xmi_obj.extract_all()
         except Exception as e:
-            logging.error(f"Error extracting {self.xmi_file}: {str(e)}")
+            logging.error(f"{datetime.datetime.now()} - Error extracting {self.xmi_file}: {str(e)}")
             return
-        
+
         # Check if contents are empty 
         try:
             if not xmi.list_all(self.xmi_file):
                 # Empty or invalid XMI
-                print(f"XMI file {self.xmi_file} is empty or invalid.")
+                logging.error(f"{datetime.datetime.now()} - XMI file {self.xmi_file} is empty or invalid.")
                 return
 
         except Exception as e:
             # Log an error if the file is not a valid XMI file
-            logging.error(f"Error processing {self.xmi_file} from ZIP file {zip}: {str(e)}")
+            logging.error(f"{datetime.datetime.now()} - Error processing {self.xmi_file} from ZIP file {zip}: {str(e)}")
             return
-    
-        return json.loads(xmi_obj.get_json()) # Return the XMI json file 
+        
+        return xmi_obj # Return the XMI object 
 
-    def _set_attributes(self):
-        """Set additional attributes based on contents of the XMI JSON file."""
-        for key, value in self.xmi_json.items():
-            # Iterate through each item in json file
-            if (key != 'file'): 
-                # Set attribute if not at file information
-                setattr(self, key, value)
+    def set_members(self):
+        """Creates a child XMIObject for each member """
+        xmi_members = self.xmi_obj.get_members(self.pds)
+        pds_folder = f'{self.repopath}/PDS'
+        os.makedirs(pds_folder, exist_ok = True) # Create repo for PDS members
+        for m in xmi_members:
+            info = self.xmi_obj.get_member_info(self.pds, m)
+            if info.get('alias'):
+                # If the member is an alias
+                alias = info.get('alias')
+                try:
+                    os.symlink(alias, f'{pds_folder}/{m}')
+                except FileExistsError:
+                    logging.error(f"{datetime.datetime.now()} - Symlink {m} to {alias} already exists")
+                except Exception as e:
+                    logging.error(f"{datetime.datetime.now()} - Error creating alias {m} to {alias} in {self.pds}")  
+                    continue
+
+                self.loglines.append(f'{datetime.datetime.now()} - Found alias {m} to {alias} in {self.pds}, moved to PDS/{m}' + '\n')
+
             else:
-                # Get mainframe file information
-                content = list(value.keys())[0] # mainframe file name  
-                content_info = value[content] # mainframe file info
+                # Otherwise create a new member
+                XMIMember(m, info, self)
 
-                if not content_info.get('COPYR1'):
-                    # For non-PDS XMI's
-                    self.content = ''
-                    self.member = XMIMember(content, content_info, self)
-                    if (self.loglines):
-                        # Append to log if main CBT file 
-                        self.loglines.append(f'{datetime.datetime.now()} - Found {name}{extension} in {content}, moved to PDS/{name}' + '\n')
-
-                else:
-                    # For XMI's with a PDS
-                    self.PDS = True
-                    self.members = {} # Create dict to store PDS members
-                    self.aliases = {} # Create dict to store aliases
-                    os.makedirs(f'{self.repopath}/PDS' , exist_ok = True) # Create repo for PDS members
-                    self.content = content # Set mainframe file name as attribute
-
-                    if (self.loglines):
-                        # Append to log if main CBT file 
-                        my_xmi = self.xmi_file.split('/')[-1]
-                        self.loglines.append(f'{datetime.datetime.now()} - Received {content} from {my_xmi} ' + '\n')
-
-                    for k, v in content_info.items():
-                        # Iterate through each item in content
-                        if (k != 'members'):
-                            # Set attribute if not at content members
-                            setattr(self, k, v) 
-
-                        else:
-                            # Add each member as a child XMIObject
-                             for name, data in v.items():
-                                ttr = data.get('ttr')
-
-                                if (data.get('alias')):
-                                    # For aliases 
-                                    self.aliases[name] = ttr
-                                    continue 
-
-                                # For all members, create a new XMIMember 
-                                xmi_member = XMIMember(name, data, self)
-                                self.members[ttr] = xmi_member
-                                extension = getattr(xmi_member, 'extension', '')
-                                if (self.loglines):
-                                    # Append to log if main CBT file 
-                                    self.loglines.append(f'{datetime.datetime.now()} - Found {name}{extension} in {content}, moved to PDS/{name}' + '\n')
-                                
-                                if (data.get('mimetype') == 'application/xmit'):
-                                    # Create new XMIObject if member is an xmi file 
-                                    self.members[ttr] = XMIObject(f'{DIR}{content}/{name}.xmi', f'{self.repopath}/{name}')
-                                    if (self.loglines):
-                                        # Append to log if main CBT file 
-                                        self.loglines.append(f'{datetime.datetime.now()} -   Received {name}.xmi to {name}' + '\n')
-                                
-                    # Deal with aliases
-                    for name, ttr in self.aliases.items():
-                        member = self.members[ttr] # Pointing to this member 
-                        if self.PDS:
-                            symlink = f'PDS/{name}'
-                        else:
-                            symlink = name
-                        os.symlink(member.name, f'{self.repopath}/{symlink}') # Create symlink
-                        if (self.loglines):
-                            # Append to log if main CBT file 
-                            self.loglines.append(f'{datetime.datetime.now()} - Found alias {name} to {member.name} in {content}, moved to {symlink}' + '\n')
-                    
-                # Write logfile
-                if (self.loglines):
-                    with open(f"{self.repopath}/cbt2git.log", "w") as file:
-                        file.writelines(self.loglines)
-
+            if info.get('mimetype') == 'application/xmit':
+                # Create new XMIObject if member is an xmi file 
+                XMIObject(f'/tmp/{self.pds}/{m}.xmi', f'{self.repopath}/{m}', self)
+        
 class XMIMember:
-    def __init__(self, name, data, parent):
+    def __init__(self, name, info, parent):
         self.name = name
+        self.pds = getattr(parent, 'pds', '')
         self.parent = parent
-        self.data = data
-
-        for key, value in data.items():
-            # Set attributes based on metadat 
+        
+        for key, value in info.items():
+            # Set attributes based on info dict  
             setattr(self, key, value)
 
         # Set defaults if missing
         setattr(self, 'mimetype', getattr(self, 'mimetype', 'application/octet-stream'))
         setattr(self, 'extension', getattr(self, 'extension', '.bin'))
 
-        self.move_file(hasattr(parent, 'PDS'))
+        self.move_member()
 
-    def move_file(self, PDS):
+    def move_member(self):
         """Move member file to destination directory based on mimetype"""
-        src_dir = f'{DIR}{self.parent.content}'
+        src_dir = f'/tmp/{self.pds}'
         dst_dir = self.parent.repopath
-
-        src = f'{src_dir}/{self.name}{self.extension}' # Set file source 
-        dst = f'{dst_dir}/{self.name}' # Set file destination
-            
+        src = f'{src_dir}/{self.name}{self.extension}'
+        docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf', 
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.oasis.opendocument.text','application/vnd.oasis.opendocument.text',
+            'application/vnd.ms-powerpoint','application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation']
+    
         if self.mimetype in docmimetypes:
             # For document types
             doc_dir = f'{dst_dir}/docs'
+            dst = f'{doc_dir}/{self.name}{self.extension}'
+
             os.makedirs(doc_dir , exist_ok = True) # Create directory for docs 
-            copy_file(src, f'{doc_dir}/{self.name}{self.extension}')
-        
+            copy_file(src, dst)
+
         elif self.mimetype in ['application/zip', 'application/java-archive']:
+            # Zip files
             dst = f'{dst_dir}/{self.name}' # Set file destination
 
-            # Zip files
             try:
+                # Try to unzip 
                 with zipfile.ZipFile(src, 'r') as zip:
                     try:
                         zip.extractall(dst)
                     except Exception as e:
-                        print(f"ZIP {zip} is not a zip file: {e}")
-                        return
-                    
+                        logging.error(f"{datetime.datetime.now()} - ZIP {zip} in {self.pds} is not a zip file: {e}")                    
             except Exception as e:
                 # Just copy file if unable to unzip 
                 copy_file(src, dst)
         
         else:
             # Copy without extension still present
-            if PDS:
-                copy_file(src, f'{dst_dir}/PDS/{self.name}')
+            if hasattr(self.parent, 'has_pds'):
+                # If the member is in a PDS
+                dst = f'{dst_dir}/PDS/{self.name}' 
             else:
-                copy_file(src, dst)
+                dst = f'{dst_dir}/{self.name}' 
+
+            copy_file(src, dst)
+        
+        logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {self.pds}, moved to PDS/{self.name}' + '\n'
+        self.parent.loglines.append(logline)
     
 def parse_arguments():
     """Parse all arguments."""
@@ -252,14 +229,26 @@ def clean_repos(github):
     """Removes remote repositories."""
     git_repos = list(github.get_user().get_repos())
     total_repos = len(git_repos)
-
     # Check if there are any repos to process
     if total_repos == 0:
         print("No repositories to delete.")
         return
     
-    print(f"Total Repos: {total_repos}")
+    if only:
+        try:
+            repo = github.get_user().get_repo(only) 
+            repo.delete()
+            print(f"Successfully deleted repository: {only}")
+        except GithubException as e:
+            if e.status == 404:
+                print(f"Repository '{only}' does not exist.")
+            else:
+                logging.error(f"{datetime.datetime.now()} - Error deleting '{only}': {e}")
+        except Exception as e:
+            logging.error(f"{datetime.datetime.now()} - Unexpected error deleting '{only}': {e}")
+        return
 
+    print(f"Total Repos: {total_repos}")
     while total_repos > 0:
         for repo in git_repos:
             if repo.name[:3] == "CBT":
@@ -273,10 +262,10 @@ def clean_repos(github):
                     git_repos.remove(repo)
                     total_repos -= 1
                 except Exception as e:
-                    logging.error(f"Error deleting {repo.name}: {e}")
+                    logging.error(f"{datetime.datetime.now()} - Error deleting {repo.name}: {e}")
                 
-                # Check if close to hitting the rate limit 
                 if rate_used >= rate_init * 0.9:  
+                    # Check if close to hitting the rate limit 
                     time_to_wait = gracetime
                     print(f"\nRate limit reached, waiting for {time_to_wait:.2f}s...")
                     time.sleep(time_to_wait + 1)  
@@ -297,7 +286,7 @@ def copy_file(src, dst):
             shutil.copyfile(src, dst)
         return dst
     else:
-        print(f"{src} not found.")
+        logging.error(f"{datetime.datetime.now()} - {src} not found.")
         if only: 
             # Stop if only processing one file 
             exit(4)
@@ -322,10 +311,6 @@ def files_to_process(flist):
     return sorted(to_process)
 
 def extract_xmi(zip):
-    loglines = []
-    cbtnum = zip.split('/CBT')[1].split('.')[0]
-    loglines.append(f'{datetime.datetime.now()} - Initialized conversion of CBT{cbtnum}' + '\n')
-
     try:
         zip_ref = zipfile.ZipFile(zip, 'r')
     except Exception as e: 
@@ -335,26 +320,26 @@ def extract_xmi(zip):
     # Check that there is was one file unzipped 
     info = zip_ref.infolist()
     if len(info) == 0:
-        print(f"No files found in ZIP {zip}")
+        logging.error(f"{datetime.datetime.now()} - No files found in ZIP {zip}")
         return
     if len(info) > 1:
-        print(f"More than one file in ZIP {zip} => {', '.join([file.filename for file in info])}")
+        logging.error(f"{datetime.datetime.now()} - More than one file in ZIP {zip} => {', '.join([file.filename for file in info])}")
         return
     
     try: 
         # Extract zip to source directory
-        zip_ref.extractall(DIR)
+        zip_ref.extractall('/tmp')
     except Exception as e:
-        print(f"Unable to extract ZIP {zip}: {e}")
+        logging.error(f"{datetime.datetime.now()} - Unable to extract ZIP {zip}: {e}")
         return
     
-    xmi_file = f'{DIR}{info[0].filename}' # Get extracted XMI
+    xmi_file = f'/tmp/{info[0].filename}' # Get extracted XMI
 
     # Set reponame for destination directory for each file
     reponame = zip.split('/')[1].split('.')[0]
     repopath = f'{repos}/{reponame}'
 
-    myXMI = XMIObject(xmi_file, repopath, loglines)
+    XMIObject(xmi_file, repopath)
 
 def get_github_token():
     try:
@@ -380,26 +365,53 @@ def create_git_repo(github, reponame):
     try:
         # Try to get repourl and return if it exists
         repourl = me.get_repo(reponame).ssh_url
-        print(f"Repo {reponame} already exists.")
         return repourl
     
     except GithubException as e:
         # If repository does not exist, create a new one
-        if e.status == 404:
-            print(f"Repo {reponame} does not exist, creating now.")
-        else:
-            print(f"An error occurred: {e}")
-            return 
+        if e.status != 404:
+            logging.error(f"{datetime.datetime.now()} - Error getting GitHub repo {reponame}: {e}")
 
-    # Create the new repository
-    try:
-        new_repo = me.create_repo(reponame)
-        print(f"Repository {reponame} created. SSH URL: {new_repo.ssh_url}")
-        return new_repo.ssh_url
-    except Exception as e:
-        print(f"Error creating github repo {reponame}: {e}")
-        time.sleep(600)
-        return
+    retry_count = 0
+    max_retries = 5
+    while retry_count < max_retries:
+        # Retry if rate limits hit
+        try:
+            rate_used, rate_init = github.rate_limiting
+            gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
+            if rate_used >= rate_init * 0.9:  # If close to limit, wait
+                print(f"Approaching rate limit. Waiting {gracetime}s...")
+                time.sleep(gracetime + 1)
+
+            # Create new repo 
+            new_repo = me.create_repo(reponame)
+            print(f"Repository {reponame} created. SSH URL: {new_repo.ssh_url}")
+            return new_repo.ssh_url   
+        
+        except requests.exceptions.ConnectionError as e:
+            # Retry if connection fails 
+            wait_time = min(30 * (2 ** retry_count) + random.uniform(0, 5), 300)  
+            print(f"Connection error: {e}. Retrying in {wait_time:.2f}s...")
+            time.sleep(wait_time)
+            retry_count += 1
+
+        except GithubException as e:
+            if e.status == 403 and "secondary rate limit" in str(e):
+                # Retry if secondary rate limit hit
+                wait_time = min(60 * (2 ** retry_count) + random.uniform(0, 5), 600)
+                print(f"Secondary rate limit hit. Waiting {wait_time:.2f}s before retrying...")
+                time.sleep(wait_time)
+                retry_count += 1
+
+            else:
+                # Other errors 
+                logging.error(f"{datetime.datetime.now()} - Error creating github repo {reponame}: {e}")
+                time.sleep(600)
+                return None
+        
+    # Failed after max retries 
+    logging.error(f"{datetime.datetime.now()} - Unable to create github repo {reponame} due to rate limits.")
+    return None  
 
 def update_git_repo(github, reponame, remote_name="origin", branch="main"):
     repourl = create_git_repo(github, reponame)
@@ -411,6 +423,7 @@ def update_git_repo(github, reponame, remote_name="origin", branch="main"):
     # Create README file 
     files  = glob.glob(f'{repopath}/PDS/@FIL*')
     if len(files) != 1:
+        # I guess I'd have to look in CBT001 here 
         readme_content = 'echo "No @FILE in PDS"'
         print(f"No @FIL(E) detected for {reponame}, creating a README.md without extra info.")
     else:
@@ -451,12 +464,12 @@ This is still a work in progress. GitHub repos will be deleted and created durin
         # Ensure repository is initialized
         if not os.path.isdir(os.path.join(repopath, ".git")):
             print("Initializing new Git repository...")
-            subprocess.run(["git", "init", "--initial-branch=main"], cwd=repopath, check=True)
+            subprocess.run(["git", "init", "--initial-branch=main"], cwd=repopath, check=True, stdout=subprocess.DEVNULL)
 
         # Check if remote already exists
         remotes = subprocess.run(["git", "remote"], cwd=repopath, capture_output=True, text=True)
         if remote_name not in remotes.stdout.split():
-            subprocess.run(["git", "remote", "add", remote_name, repourl], cwd=repopath, check=True)
+            subprocess.run(["git", "remote", "add", remote_name, repourl], cwd=repopath, check=True, stdout=subprocess.DEVNULL)
             print(f"Remote '{remote_name}' added: {repourl}")
 
         # Check if there are changes to commit
@@ -466,23 +479,25 @@ This is still a work in progress. GitHub repos will be deleted and created durin
             return
 
         # Stage all changes
-        subprocess.run(["git", "add", "."], cwd=repopath, check=True)
+        subprocess.run(["git", "add", "."], cwd=repopath, check=True, stdout=subprocess.DEVNULL)
 
         # Commit changes
-        #commit_message = f'Updates from cbttape.org ({datetime.datetime.now().strftime("%Y-%m-%d")})'
-        commit_message = 'test'
-        subprocess.run(["git", "commit", "-m", commit_message, "--quiet"], cwd=repopath, check=True)
+        commit_message = f'Updates from cbttape.org ({datetime.datetime.now().strftime("%Y-%m-%d")})'
+        subprocess.run(["git", "commit", "-m", commit_message, "--quiet"], cwd=repopath, check=True, stdout=subprocess.DEVNULL)
         print("Changes committed successfully.")
 
         # Push changes
-        subprocess.run(["git", "push", remote_name, branch], cwd=repopath, check=True)
+        subprocess.run(["git", "push", remote_name, branch], cwd=repopath, check=True, stdout=subprocess.DEVNULL)
         print(f"Changes pushed to {remote_name}/{branch} successfully.")
 
     except subprocess.CalledProcessError as e:
-        print(f"Error running Git command: {e}")
+        logging.error(f"{datetime.datetime.now()} - Error running Git command for repo {reponame}: {e}")
+
+    return
 
 def main():
     global repos, stage, only, cbtfiles, noremote
+
     # Parse arguments
     args = parse_arguments()
 
@@ -491,6 +506,7 @@ def main():
     only     = args.only
     cbtfiles = args.cbtfiles
     noremote = args.noremote
+    no_unzip = False
 
     if not noremote:    
         github = get_github_token()
@@ -507,40 +523,49 @@ def main():
     
     # Clean local/remote repositories 
     if args.clean:
-        os.system(f'rm -rf {cbtfiles}/*')
-        os.system(f'rm -rf {repos}/*')
+        if only:
+            os.system(f'rm -rf {cbtfiles}/{only}')
+            os.system(f'rm -rf {repos}/{only}')
+        else:
+            os.system(f'rm -rf {cbtfiles}/*')
+            os.system(f'rm -rf {repos}/*')
         if not noremote:
             clean_repos(github)
     
-    # Create repo/cbtfile directory if they don't exist
-    os.makedirs(repos, exist_ok = True)
-    os.makedirs(cbtfiles, exist_ok = True)
+    if not no_unzip:
+        # Create repo/cbtfile directory if they don't exist
+        os.makedirs(repos, exist_ok = True)
+        os.makedirs(cbtfiles, exist_ok = True)
 
-    # Read pickle
-    cbt = pd.read_pickle(args.pickle)
-    print(f"Loaded our dataframe, {len(cbt)} CBT-files ready to be processed.")
+        # Read pickle
+        cbt = pd.read_pickle(args.pickle)
+        print(f"Loaded our dataframe, {len(cbt)} CBT-files ready to be processed.")
 
-    # Get list of files to process
-    to_process = files_to_process(os.listdir(stage))
+        # Get list of files to process
+        to_process = files_to_process(os.listdir(stage))
 
-    threads = []
-    for index, zip in enumerate(to_process):
-        pct = math.floor((index / len(to_process)) * 100)
-        done = math.floor((pct / 100) * 40)
-        todo = 40 - done
-        done_bar = "✅" * done
-        todo_bar = "🟩" * todo
+        threads = []
+        for index, zip in enumerate(to_process):
+            pct = math.floor((index / len(to_process)) * 100)
+            done = math.floor((pct / 100) * 40)
+            todo = 40 - done
+            done_bar = "✅" * done
+            todo_bar = "🟩" * todo
 
-        print(f'{done_bar}{todo_bar} {zip} ({pct}%) [converting, active threads={threading.active_count()}]', end='\r', flush=True)
-        while threading.active_count() >= MAX_THREAD_DOWNLOADS + 1:  # +1 for the main thread
-            time.sleep(0.5)
-        
-        # Extract XMI and copy contents to target directories
-        thread = threading.Thread(target=extract_xmi, args=(zip, ))
-        thread.start()
-        threads.append(thread)
+            print(f'{done_bar}{todo_bar} {zip} ({pct}%) [converting, active threads={threading.active_count()}]', end='\r', flush=True)
+            while threading.active_count() >= MAX_THREAD_DOWNLOADS + 1:  # +1 for the main thread
+                time.sleep(0.5)
+            
+            # Extract XMI and copy contents to target directories
+            thread = threading.Thread(target=extract_xmi, args=(zip, ))
+            thread.start()
+            threads.append(thread)
 
-    time.sleep(20) # Wait for threads to finish
+        done = 40 * "✅" 
+        pct = 100
+        z=''
+        print(f'{done} {z} ({pct}%)', flush=True)
+        time.sleep(20) # Wait for threads to finish
 
     if not noremote:
         my_repos = sorted(os.listdir(repos)) # list of CBT repos
@@ -560,7 +585,8 @@ def main():
             done_bar = "✅" * done
             todo_bar = "🟩" * todo
 
-            print(f'{done_bar}{todo_bar} {zip} ({pct}%) [updating, active threads={threading.active_count()}]', end='\r', flush=True)
+            print(f'{done_bar}{todo_bar} {reponame} ({pct}%) [updating, active threads={threading.active_count()}]', end='\r', flush=True)
+            
             while threading.active_count() >= MAX_THREAD_DOWNLOADS + 1:  # +1 for the main thread
                 time.sleep(0.5)
 
@@ -569,5 +595,16 @@ def main():
             thread.start()
             threads.append(thread)
 
+        done = 40 * "✅" 
+        pct = 100
+        z=''
+        print(f'{done} {z} ({pct}%)', flush=True)
+
+    # Write buffered logs to file 
+    logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
+    with open(logfile, "w") as f:
+        f.write(log_buffer.getvalue())
+    log_buffer.close()
+    
 if __name__ == '__main__':
     main()
