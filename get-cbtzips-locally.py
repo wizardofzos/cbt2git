@@ -5,18 +5,13 @@ from ftplib import FTP, error_perm
 import parse
 import pandas as pd
 import math
-import logging
 import threading 
 import time
 import datetime
+import zipfile
 
 # Global variables
-PROGRESS_LENGTH = 40
 FTP_SERVER = 'ftp.cbttape.org'
-MAX_THREAD_DOWNLOADS = 15
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
 
 def parse_arguments():
     """Parse all arguments."""
@@ -35,11 +30,17 @@ def parse_arguments():
                         help = "Panda pickle file to save CBT's UPDATESTOC.txt information to. Defaults to ./cbt.pkl.")
     parser.add_argument("--force",
                         action = "store_true",
-                        help = "Ingore filesizes, always download everything.")
+                        help = "Ignore filesizes, always download everything.")
     parser.add_argument("--updates",
                         action="store_true",
                         help="Only check and download the updates from cbttape.org.")
-    
+    parser.add_argument("--clean",
+                    action = "store_true",
+                    help = "Cleans stage folder.")
+    parser.add_argument("--only", 
+                    type = str,
+                    default = False,
+                    help = "Only download this CBT Tape.")
     return parser.parse_args()
 
 def threaded_download(remotefile, localfile):
@@ -57,7 +58,7 @@ def threaded_download(remotefile, localfile):
             ftp.retrbinary(f'RETR {remotefile}', fp.write)
         return ftp
     except Exception as e:
-        logging.error(f"Failed to retrieve {remotefile} from {FTP_SERVER}: {e}")
+        print(f"Failed to retrieve {remotefile} from {FTP_SERVER}: {e}")
         return
 
 def parse_updates():
@@ -81,105 +82,120 @@ def parse_updates():
     
     return cbtinfo
 
-def process_files(df, ftp, stage, force=False):
-    """Process all files from dataframe.
+args = parse_arguments()
+stage = args.stage
+only = args.only
 
-    Keyword arguments: 
-    df -- CBTTAPE DataFrame
-    ftp -- ftp server to download from
-    stage -- Path to stage folder
-    force -- Always download (default False)
-    """
-    threads = []
-    i = 0
+if args.clean:
+    # Clean local repositories
+    if only:
+        os.system(f'rm -rf {stage}/{only}.zip')
+        print(f"Removed {only}.zip")
+    else:
+        os.system(f'rm -rf {stage}/*')
+        print("Removed stage directory.")
+
+# Create stage directory if it doesn't exist
+os.makedirs(stage, exist_ok=True)
+
+start = time.time()
+
+# Retrieve the UPDATESTOC.txt file from cbttage.org
+print(f'Connecting to FTP server: {FTP_SERVER}')
+ftp = threaded_download('pub/updates/UPDATESTOC.txt', 'updates')
+
+# Retrieve CBTF1  
+threaded_download('pub/cbt/CBTF1.zip', 'CBTF1.zip')
+# Unzip  
+try:
+    print("Unzipping CBTF1.zip to CBTF1.txt")
+    zip_ref = zipfile.ZipFile("CBTF1.zip", 'r')
+except Exception as e: 
+    print(f"ZIP CBTF1.zip is not a zip file: {e}")
+try: 
+    # Extract zip to current directory
+    zip_ref.extractall()
+except Exception as e:
+    print(f"Unable to extract CBTF1: {e}")
+
+# Parse the UPDATESTOC.txt file for updates 
+cbtinfo = {'cbtnum': [], 'path': [], 'comment': [], 'updated': [], 'info': []}
+
+with open('updates') as updt:
+    updates = updt.readlines()
+
+for update in updates[:-1]:  # Skip the last line
+    file, comment, updated, info = parse.parse('//*+{}:  {}*{}  {}\n', update)
+    cbtnum = file.split('FILE')[1].strip() if 'FILE' in file else file.split('File')[1].strip()
+    updated = updated == '#'
+    dlpath = f'pub/updates/CBT{cbtnum}.zip' if updated else f'pub/cbt/CBT{cbtnum}.zip'
     
-    for index, data in df.iterrows():
-        i += 1
-        pct = math.floor((i/len(df))*100)
-        done = math.floor((pct/100)*40)
-        todo = 40 - done
-        done = done * "✅"
-        todo = todo * "🟩"
-        
-        fname = data['path']
-        stagefile = f"{stage}/{fname.split('/')[-1]}"
+    cbtinfo['cbtnum'].append(cbtnum)
+    cbtinfo['path'].append(dlpath)
+    cbtinfo['comment'].append(comment.strip())
+    cbtinfo['updated'].append(updated)
+    cbtinfo['info'].append(info)
 
-        # Attempt to retrieve remote file size
-        try:
-            filesize_remote = ftp.size(fname)
-            if force:
-                filesize_remote = -10
-        except error_perm:
-            logging.warning(f"{fname} in TOC not present on server, skipping..")
-        except Exception as e:
-            logging.error(f"Error retrieving size for {fname}: {e}")
-            continue
+# Save as pickle
+cbt = pd.DataFrame.from_dict(cbtinfo)
+cbt.to_pickle(f'{args.pickle}')
+print(f'Dataframe saved as {args.pickle}, {len(cbt)} CBT-files indexed')
 
-        # Attempt to retrieve local file size
-        try:
-            filesize_local = os.stat(stagefile).st_size
-        except FileNotFoundError: # local file is missing
-            filesize_local = 0
-        except Exception as e:
-            logging.error(f"Error retrieving size for local file {stagefile}: {e}")
-            continue
+to_process = cbt.query('updated == True') if args.updates else cbt # Only process updated files if specified 
+extra = "Only processing files with the update flag." if args.updates else "" 
+extra2 = "(Forcing download, not comparing remote/local filesizes)." if args.force else ""
 
-        # Download remote file
-        if filesize_local != filesize_remote:
-            print(f'{done}{todo} {fname} ({pct}%) [downloading, active threads={threading.active_count()}]', end='\r', flush=True)
-            while threading.active_count() >= MAX_THREAD_DOWNLOADS:
-                time.sleep(0.5)
-            t = threading.Thread(target=threaded_download, args=(fname, stagefile))
-            threads.append(t)
-            t.start()
-        else:
-            print(f'{done}{todo} {fname} ({pct}%) [up-to-date , active threads={threading.active_count()}]', end='\r', flush=True)
+print(f'\nProcessing {len(to_process)} files. {extra} {extra2}\n')
 
-    while threading.active_count() > 1:
-        print(f'{done}{todo} {fname} ({pct}%) [waiting to finish {threading.active_count()} active threads]  ', end='\r', flush=True)
-        time.sleep(0.5)
+threads = []
+i = 0
+for index, data in to_process.iterrows():
+    i += 1
+    pct = math.floor((i/len(to_process))*100)
+    done = math.floor((pct/100)*40)
+    todo = 40 - done
+    done = done * "✅"
+    todo = todo * "🟩"
+    
+    fname = data['path']
+    stagefile = f"{stage}/{fname.split('/')[-1]}"
 
-def main():
-    args = parse_arguments()
-
-    MAX_THREAD_DOWNLOADS = args.threads
-    stage = args.stage
-
-    # Create stage directory if it doesn't exist
-    os.makedirs(stage, exist_ok=True)
-
-    start = time.time()
-
-    # Retrieve the UPDATESTOC.txt file from cbttage.org
-    print(f'Connecting to FTP server: {FTP_SERVER}')
-    ftp = threaded_download('pub/updates/UPDATESTOC.txt', 'updates')
-
-    # Parse the UPDATESTOC.txt file for new updates
-    cbtinfo = parse_updates()
-
-    # Save as pickle
-    cbt = pd.DataFrame.from_dict(cbtinfo)
-    cbt.to_pickle(f'{args.pickle}')
-    print(f'Dataframe saved as {args.pickle}, {len(cbt)} CBT-files indexed')
-
-    # Process updated files
-    extra = "(forcing download, not comparing remote/local filesizes)" if args.force else ""
-    updates = cbt.query('updated == True')
-
-    print(f'\nProcessing {len(updates)} files with the update flag {extra}\n')
+    # Attempt to retrieve remote file size
     try:
-        process_files(updates, ftp, stage, force=args.force)
+        filesize_remote = ftp.size(fname)
+        if args.force:
+            filesize_remote = -10
+    except error_perm:
+        print(f"{fname} in TOC not present on server, skipping..")
+        continue
     except Exception as e:
-        logging.error(f"An error occurred while processing the updates: {e}")
+        print(f"Error retrieving size for {fname}: {e}")
+        continue
 
-    if not args.updates:
-        rest = cbt.loc[cbt.updated==False]
-        print(f'\nProcessing {len(rest)} files without the update flag {extra}\n')
-        process_files(rest, ftp, stage, force=args.force)
+    # Attempt to retrieve local file size
+    try:
+        filesize_local = os.stat(stagefile).st_size
+    except FileNotFoundError: # local file is missing
+        filesize_local = 0
+    except Exception as e:
+        print(f"Error retrieving size for local file {stagefile}: {e}")
+        continue
 
-    stop = time.time()
-    print(f'All requested CBT files updated from cbttape.org into {args.stage}')
-    print(f'This operation took {datetime.timedelta(seconds=stop-start)}')
+    # Download remote file
+    if filesize_local != filesize_remote:
+        print(f'{done}{todo} {fname} ({pct}%) [downloading, active threads={threading.active_count()}]', end='\r', flush=True)
+        while threading.active_count() >= args.threads:
+            time.sleep(0.5)
+        t = threading.Thread(target=threaded_download, args=(fname, stagefile))
+        threads.append(t)
+        t.start()
+    else:
+        print(f'{done}{todo} {fname} ({pct}%) [up-to-date , active threads={threading.active_count()}]', end='\r', flush=True)
 
-if __name__ == '__main__':
-    main()
+# Wait for all threads to complete
+for thread in threads:
+    thread.join()
+
+stop = time.time()
+print(f'All requested CBT files updated from cbttape.org into {args.stage}')
+print(f'This operation took {datetime.timedelta(seconds=stop-start)}')
