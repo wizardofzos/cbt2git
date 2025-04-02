@@ -12,7 +12,6 @@ import pandas as pd
 import zipfile
 import yaml
 from github import Github, GithubException
-import random
 import requests
 import glob
 import re
@@ -42,7 +41,8 @@ logger = logging.getLogger(__name__)
 class XMIObject:
     def __init__(self, name, xmi_file, parent = None):
         self.name = name
-        self.xmi_file = xmi_file     
+        self.xmi_file = xmi_file    
+        self.parent = parent 
 
         self.xmi_obj = self.extract_xmi()
         if not self.xmi_obj:
@@ -87,13 +87,22 @@ class XMIObject:
             
             else:
                 # If nested, add loglines to parent loglines 
-                parent.loglines.append(str(self.loglines))
+                parent.loglines.extend(self.loglines)
                 # Add zigi info 
                 parent.zigidsn += self.zigidsn
                 parent.zigispf[self.name.split('/')[1]] = self.zigispf[self.name]
             
             shutil.rmtree(f"/tmp/{self.pds}") # Remove PDS directory in /tmp
+        
+        else:
+            # If not a PDS, add the file as the only member
+            logger.info(f"Adding {filename} as the only member of {self.name}")
+            info = self.xmi_obj.get_file_info_simple(filename) # Get file info 
+            xmi_member = XMIMember(filename, info, self) # Create new member 
+            os.remove(f"/tmp/{filename}{xmi_member.extension}") # Remove file from previous location
 
+        # Remove xmi_file from /tmp folder
+        os.remove(self.xmi_file)  
     def extract_xmi(self):
         """Opens the XMI file and extracts its contents."""
         try:
@@ -130,8 +139,11 @@ class XMIObject:
         """Creates a child XMIObject for each member """
         # xmi_members = self.xmi_obj.get_members(self.pds)
         xmi_members = json.loads(self.xmi_obj.get_json()).get('file').get(self.pds).get('members')
-        pds_folder = f'{self.repopath}/PDS'
-        os.makedirs(pds_folder, exist_ok = True) # Create repo for PDS members
+        if not self.parent:
+            pds_folder = f'{self.repopath}/PDS'
+            os.makedirs(pds_folder, exist_ok = True) # Create repo for PDS members
+        else:
+            pds_folder = self.repopath
 
         for m, info in xmi_members.items():
             # Iterate through each member in the PDS
@@ -177,7 +189,7 @@ class XMIMember:
         self.move_member()
 
         # Add ispf stats (not sure if I should do this for all members or not)
-        if not hasattr(self, 'ispf'):
+        if not getattr(self, 'ispf', ''):
             self.ispf = {'version': '01.00', 'flags': 0, 'createdate': '1976-06-12T00:00:00.000000', 'modifydate': '1976-06-12T22:18:12.000000', 
                          'lines': 0, 'newlines': 0, 'modlines': 0, 'user': 'CBT2GIT'}
         self.ispfstats()
@@ -243,16 +255,18 @@ class XMIMember:
                 copy_file(src, dst)
         
         else:
+            nested = getattr(self.parent, 'parent', '')
             # Copy without extension still present
-            if hasattr(self.parent, 'pds'):
+            if hasattr(self.parent, 'pds') and not nested:
                 # If the member is in a PDS
                 dst = f'{dst_dir}/PDS/{self.name}' 
-
             else:
                 dst = f'{dst_dir}/{self.name}' 
             copy_file(src, dst)
         
-        logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {self.pds}, moved to PDS/{self.name}' + '\n'
+        src_loc = src.split('/tmp/')[1]
+        dst_loc = dst.split(f'{repos}/')[1]
+        logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}' + '\n'
         self.parent.loglines.append(logline)
 
 def parse_arguments():
@@ -391,7 +405,7 @@ def git_attributes(reponame):
 def create_git_repo(reponame):
     """Creates new GitHub repo."""
     retry_count = 0
-    max_retries = 10
+    max_retries = 5
     while retry_count < max_retries:
         # Retry if rate limits hit
         rate_used, rate_init = GITHUB_CLIENT.rate_limiting
@@ -409,14 +423,16 @@ def create_git_repo(reponame):
             return repourl
         
         except requests.exceptions.ConnectionError as e:
-            wait_time = min(30 * (2 ** retry_count) + random.uniform(0, 5), 300)  
+            logger.warning(f"Connection error while creating {reponame}, retrying: {e}")
+            wait_time = 30 * 2 * retry_count
             time.sleep(wait_time)
             retry_count += 1
 
         except GithubException as e:
             if e.status == 403 and "secondary rate limit" in str(e):
                 # Retry if secondary rate limit hit
-                wait_time = min(60 * (2 ** retry_count) + random.uniform(0, 5), 600)
+                logger.warning(f"Secondary rate limit hit while creating {reponame}, retrying: {e}")
+                wait_time = 30 * 2 * retry_count
                 time.sleep(wait_time)
                 retry_count += 1
             else:
@@ -652,11 +668,11 @@ for index, zip in enumerate(sorted(to_process)):
 done = 40 * "✅" 
 pct = 100
 z=''
-print(f'{done} {z} ({pct}%)', flush=True)
+print(f'{done} {z} ({pct}%)                                        ', flush=True)
 
 stop = time.time()
 if not noremote:
     print(f'All requested CBT files converted to Github repos in github.com/{username}.')
 else:
     print(f'All requested CBT files converted and moved to {repos}')
-print(f'This operation took {datetime.time(minute=stop-start)}')
+print(f'This operation took {datetime.timedelta(seconds=stop-start)}')
