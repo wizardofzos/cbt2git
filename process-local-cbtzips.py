@@ -56,14 +56,13 @@ class XMIObject:
         self.loglines = [] # For cbt2git log 
         xmi_filename = xmi_file.split('/')[-1]
         self.loglines.append(f'{datetime.datetime.now()} - Received {filename} from {xmi_filename} ' + '\n')
+        self.zigidsn = (f'{filename} PO FB 80 32720' + "\n")
 
         if (self.xmi_obj.is_pds(filename)):
-            # if the file is a PDS, set members as new XMIMembers
-            self.pds = filename
-            self.zigidsn = (f'{filename} PO FB 80 32720' + "\n")
             self.zigispf = {}
             self.zigispf[self.name] = []
-
+            # if the file is a PDS, set members as new XMIMembers
+            self.pds = filename
             self.create_members() # get all members of the PDS
 
             if not parent:
@@ -99,6 +98,13 @@ class XMIObject:
             logger.info(f"Adding {filename} as the only member of {self.name}")
             info = self.xmi_obj.get_file_info_simple(filename) # Get file info 
             xmi_member = XMIMember(filename, info, self) # Create new member 
+            if parent:
+                parent.loglines.extend(self.loglines)
+                parent.zigidsn += self.zigidsn
+                parent.zigispf[self.name.split('/')[1]] = xmi_member.ispfline
+
+            else:
+                logger.info("Is there any like this?")
             os.remove(f"/tmp/{filename}{xmi_member.extension}") # Remove file from previous location
 
         # Remove xmi_file from /tmp folder
@@ -132,7 +138,7 @@ class XMIObject:
             logger.error(f"Error processing {self.xmi_file} from {self.name}: {str(e)}")
             return None
         
-        logger.info(f"Received {self.xmi_file} from {self.name}.")
+        logger.info(f"Received {self.xmi_file.split('tmp/')[1]} from {self.name}.")
         return xmi_obj # Return the XMI object 
 
     def create_members(self):
@@ -154,9 +160,9 @@ class XMIObject:
                     # Create a symlink 
                     os.symlink(alias, f'{pds_folder}/{m}')
                 except FileExistsError:
-                    logger.warning(f"Symlink {m} to {alias} already exists for CBT{self.name}.")
+                    logger.warning(f"Symlink {m} to {alias} already exists for {self.name}.")
                 except Exception as e:
-                    logger.error(f"Error creating alias {m} to {alias} in {self.pds} for CBT{self.name}.")  
+                    logger.error(f"Error creating alias {m} to {alias} in {self.pds} for {self.name}.")  
                     continue
 
                 self.loglines.append(f'{datetime.datetime.now()} - Found alias {m} to {alias} in {self.pds}, moved to PDS/{m}' + '\n')
@@ -219,7 +225,8 @@ class XMIMember:
         
     def move_member(self):
         """Move member file to destination directory based on mimetype"""
-        if hasattr(self.parent, 'pds'):
+        in_pds = hasattr(self.parent, 'pds')
+        if in_pds:
             src_dir = f'/tmp/{self.pds}'
         else:
             src_dir = f'/tmp'
@@ -257,16 +264,19 @@ class XMIMember:
         else:
             nested = getattr(self.parent, 'parent', '')
             # Copy without extension still present
-            if hasattr(self.parent, 'pds') and not nested:
+            if in_pds and not nested:
                 # If the member is in a PDS
                 dst = f'{dst_dir}/PDS/{self.name}' 
             else:
                 dst = f'{dst_dir}/{self.name}' 
             copy_file(src, dst)
         
-        src_loc = src.split('/tmp/')[1]
-        dst_loc = dst.split(f'{repos}/')[1]
-        logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}' + '\n'
+        dst_loc = dst.split(f'{repos}/')[1].split('/', 1)[1]
+        if not in_pds:
+            logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}), moved to {dst_loc}' + '\n'
+        else:
+            src_loc = src_dir.split('/tmp/')[1]
+            logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}' + '\n'
         self.parent.loglines.append(logline)
 
 def parse_arguments():
@@ -472,7 +482,8 @@ def commit_git_repo(reponame, repourl, remote_name="origin", branch="main"):
         changed_files = [line.split()[-1] for line in git_status.stdout.strip().split("\n") if line]
         # Filter out cbt2git.log
         non_log_changes = [f for f in changed_files if os.path.basename(f) != "cbt2git.log"]
-        if not non_log_changes:
+        #if not non_log_changes:
+        if not changed_files:
             logger.info(f"No updates found for {repourl}.")
             return
 
