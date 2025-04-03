@@ -19,9 +19,8 @@ import subprocess
 
 # Global variables
 CONFIG_FILE = "config.yml"
-# Don't contain XMI files 
-SKIP = ["CBT001", "CBT002", "CBT003", "CBT004", "CBT005", "CBT007", 
-        "CBT018", "CBT063", "CBT064", "CBT110", "CBT157", "CBT230"] 
+# Don't contain .DATA files 
+SKIP = ["CBT001", "CBT002", "CBT003", "CBT004", "CBT005", "CBT007", "CBT018", "CBT061", "CBT063", "CBT064", "CBT110", "CBT157", "CBT230"] 
 
 # Configure logfile info
 logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
@@ -142,7 +141,7 @@ class XMIObject:
         return xmi_obj # Return the XMI object 
 
     def create_members(self):
-        """Creates a child XMIObject for each member """
+        """Creates a child XMIMember for each member """
         # xmi_members = self.xmi_obj.get_members(self.pds)
         xmi_members = json.loads(self.xmi_obj.get_json()).get('file').get(self.pds).get('members')
         if not self.parent:
@@ -226,6 +225,8 @@ class XMIMember:
     def move_member(self):
         """Move member file to destination directory based on mimetype"""
         in_pds = hasattr(self.parent, 'pds')
+        nested = getattr(self.parent, 'parent', '')
+
         if in_pds:
             src_dir = f'/tmp/{self.pds}'
         else:
@@ -259,10 +260,19 @@ class XMIMember:
                         logger.error(f"ZIP {zip} in {self.pds} is not a zip file: {e}")                    
             except Exception as e:
                 # Just copy file if unable to unzip 
+                logging.warning(f"Unable to unzip {zip} in {self.pds}, copying istead: {e}")
                 copy_file(src, dst)
-        
+
+        elif self.mimetype == 'application/xmit':
+            # Copy with extension still present
+            if in_pds and not nested:
+                # If the member is in a PDS
+                dst = f'{dst_dir}/PDS/{self.name}{self.extension}' 
+            else:
+                dst = f'{dst_dir}/{self.name}{self.extension}' 
+            copy_file(src, dst)
+
         else:
-            nested = getattr(self.parent, 'parent', '')
             # Copy without extension still present
             if in_pds and not nested:
                 # If the member is in a PDS
@@ -276,7 +286,10 @@ class XMIMember:
             logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}), moved to {dst_loc}' + '\n'
         else:
             src_loc = src_dir.split('/tmp/')[1]
-            logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}' + '\n'
+            if self.mimetype == 'application.xmit':
+                logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}{self.extension}' + '\n'
+            else:
+                logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}' + '\n'
         self.parent.loglines.append(logline)
 
 def parse_arguments():
@@ -529,6 +542,7 @@ if not noremote:
         GITHUB_USER = GITHUB_CLIENT.get_user()
         username = GITHUB_USER.login
         print(f"Token has logged onto {GITHUB_USER} acting as GitHub user github.com/{username}")
+
     except Exception as e:
         print(f"Unable to log into GitHub: {e}")
         exit(4)
@@ -608,23 +622,41 @@ for index, zip in enumerate(sorted(to_process)):
         continue
 
     if not noremote:
+        if index != 0 and index % 10 == 0:
+            print(f'{done_bar}{todo_bar} Sleep for 30s ({pct}%)                             ', end='\r', flush=True)
+            time.sleep(30)
+
         # Skip the GitHub steps if noremote specified
         print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True)
         readme_file(name) # Create README file
         git_attributes(name) # Create .gitattributes file
 
+        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+        if rate_used >= rate_init * 0.9:  
+            # Check if close to hitting the rate limit 
+            time_to_wait = gracetime
+            print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
+            time.sleep(time_to_wait + 1)  
+
         new_repo = False
         try:
             repo = GITHUB_USER.get_repo(name)
             repourl = repo.ssh_url
+            logger.info(f"Repo {name} already exists.")
         except GithubException as e:
             if e.status == 404:
-                logger.info(f"Repo {repourl} does not exist.")
+                logger.info(f"Repo {name} does not exist.")
                 new_repo = True
             else:
                 logger.error(f"Error getting GitHub repo {name}: {e}")
                 continue
-
+        except requests.exceptions.ConnectionError as e:
+            # Why does this keep happening...
+            logger.error(f"Connection error while creating {repo}: {e}")
+            time.sleep(600)
+            continue
+                    
         if not new_repo and args.clean:
             # Remove repo if clean specified
             rate_used, rate_init = GITHUB_CLIENT.rate_limiting
@@ -639,16 +671,16 @@ for index, zip in enumerate(sorted(to_process)):
             try: 
                 repo.delete()
                 new_repo = True
-                time.sleep(10)
+                time.sleep(15)
                 logger.info(f"Removed Github repo {repourl}.")
             except Exception as e:
                 logger.error(f"Error deleting Github repo {repourl}: {e}")
 
-        if new_repo:
+        if new_repo: 
             # If repository does not exist, create a new one
             print(f'{done_bar}{todo_bar} Creating GitHub repo {name} ({pct}%)            ', end='\r', flush=True)
             repourl = create_git_repo(name)
-            time.sleep(10)
+            time.sleep(15)
             if not repourl:
                 # Continue if problems creating git repo
                 continue
@@ -663,23 +695,20 @@ for index, zip in enumerate(sorted(to_process)):
 
         print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True) 
         commit_git_repo(name, repourl) # Commit updates 
+        time.sleep(15)
 
         rate_used, rate_init = GITHUB_CLIENT.rate_limiting
         gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
         if gracetime > 0:
             print(f'{done_bar}{todo_bar} Rate critical ({rate_used}/{rate_init}), gracetime={gracetime} ({pct}%) '   , end='\r', flush=True)
             time.sleep(gracetime*3)
-
-        if index != 0 and index % 10 == 0:
-            print(f'{done_bar}{todo_bar} Sleep for 60s ({pct}%)                             ', end='\r', flush=True)
-            time.sleep(60)
     
     logger.info(f"Completed conversion of {name}.")
 
 done = 40 * "✅" 
 pct = 100
 z=''
-print(f'{done} {z} ({pct}%)                                        ', flush=True)
+print(f'{done} {z} ({pct}%)                                                  ', flush=True)
 
 stop = time.time()
 if not noremote:
