@@ -53,7 +53,6 @@ def threaded_download(remotefile, localfile):
     try:
         ftp = FTP(FTP_SERVER)
         ftp.login()
-        print(f'Anonymous login succeeded, retrieving {remotefile}')
         with open(localfile, 'wb') as fp:
             ftp.retrbinary(f'RETR {remotefile}', fp.write)
         return ftp
@@ -87,13 +86,8 @@ stage = args.stage
 only = args.only
 
 if args.clean:
-    # Clean local repositories
-    if only:
-        os.system(f'rm -rf {stage}/{only}.zip')
-        print(f"Removed {only}.zip")
-    else:
-        os.system(f'rm -rf {stage}/*')
-        print("Removed stage directory.")
+    os.system(f'rm -rf {stage}/*')
+    print("Removed stage directory.")
 
 # Create stage directory if it doesn't exist
 os.makedirs(stage, exist_ok=True)
@@ -103,13 +97,16 @@ start = time.time()
 # Retrieve the UPDATESTOC.txt file from cbttage.org
 print(f'Connecting to FTP server: {FTP_SERVER}')
 ftp = threaded_download('pub/updates/UPDATESTOC.txt', 'updates')
+print(f'Anonymous login succeeded, retrieved UPDATESTOC.txt')
 
 # Retrieve CBTF1  
 threaded_download('pub/cbt/CBTF1.zip', 'CBTF1.zip')
+print(f'Anonymous login succeeded, retrieved CBTF1.zip')
 # Unzip  
 try:
     print("Unzipping CBTF1.zip to CBTF1.txt")
     zip_ref = zipfile.ZipFile("CBTF1.zip", 'r')
+    os.remove("CBTF1.zip")
 except Exception as e: 
     print(f"ZIP CBTF1.zip is not a zip file: {e}")
 try: 
@@ -141,7 +138,7 @@ cbt = pd.DataFrame.from_dict(cbtinfo)
 cbt.to_pickle(f'{args.pickle}')
 print(f'Dataframe saved as {args.pickle}, {len(cbt)} CBT-files indexed')
 
-to_process = cbt.query('updated == True') if args.updates else cbt # Only process updated files if specified 
+to_process = cbt.query(f'cbtnum == True') if args.updates else cbt # Only process updated files if specified 
 extra = "Only processing files with the update flag." if args.updates else "" 
 extra2 = "(Forcing download, not comparing remote/local filesizes)." if args.force else ""
 
@@ -150,6 +147,7 @@ print(f'\nProcessing {len(to_process)} files. {extra} {extra2}\n')
 threads = []
 i = 0
 for index, data in to_process.iterrows():
+    print(data['cbtnum'])
     i += 1
     pct = math.floor((i/len(to_process))*100)
     done = math.floor((pct/100)*40)
@@ -166,7 +164,7 @@ for index, data in to_process.iterrows():
         if args.force:
             filesize_remote = -10
     except error_perm:
-        print(f"{fname} in TOC not present on server, skipping..")
+        print(f"{fname} in TOC not present on server, skipping...")
         continue
     except Exception as e:
         print(f"Error retrieving size for {fname}: {e}")
