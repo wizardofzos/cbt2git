@@ -16,7 +16,7 @@ FTP_SERVER = 'ftp.cbttape.org'
 def parse_arguments():
     """Parse all arguments."""
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
-                                     description = "collect and keep a local copy of all the files from cbttape.org.")
+                                     description = "Collect and keep a local copy of all the files from cbttape.org.")
     parser.add_argument("--stage",
                         type = str,
                         default = f'{os.getcwd()}/stage',
@@ -37,14 +37,10 @@ def parse_arguments():
     parser.add_argument("--clean",
                     action = "store_true",
                     help = "Cleans stage folder.")
-    parser.add_argument("--only", 
-                    type = str,
-                    default = False,
-                    help = "Only download this CBT Tape.")
     return parser.parse_args()
 
-def threaded_download(remotefile, localfile):
-    """Do a threaded download.
+def download_file(remotefile, localfile):
+    """Download remote file to local file.
     
     Keyword arguments:
     remotefile -- remote filename
@@ -59,31 +55,9 @@ def threaded_download(remotefile, localfile):
     except Exception as e:
         print(f"Failed to retrieve {remotefile} from {FTP_SERVER}: {e}")
         return
-
-def parse_updates():
-    """Parse the UPDATESTOC.txt file for new updates"""
-    cbtinfo = {'cbtnum': [], 'path': [], 'comment': [], 'updated': [], 'info': []}
-
-    with open('updates') as updt:
-        updates = updt.readlines()
     
-    for update in updates[:-1]:  # Skip the last line
-        file, comment, updated, info = parse.parse('//*+{}:  {}*{}  {}\n', update)
-        cbtnum = file.split('FILE')[1].strip() if 'FILE' in file else file.split('File')[1].strip()
-        updated = updated == '#'
-        dlpath = f'pub/updates/CBT{cbtnum}.zip' if updated else f'pub/cbt/CBT{cbtnum}.zip'
-        
-        cbtinfo['cbtnum'].append(cbtnum)
-        cbtinfo['path'].append(dlpath)
-        cbtinfo['comment'].append(comment.strip())
-        cbtinfo['updated'].append(updated)
-        cbtinfo['info'].append(info)
-    
-    return cbtinfo
-
 args = parse_arguments()
 stage = args.stage
-only = args.only
 
 if args.clean:
     os.system(f'rm -rf {stage}/*')
@@ -96,11 +70,11 @@ start = time.time()
 
 # Retrieve the UPDATESTOC.txt file from cbttage.org
 print(f'Connecting to FTP server: {FTP_SERVER}')
-ftp = threaded_download('pub/updates/UPDATESTOC.txt', 'updates')
+ftp = download_file('pub/updates/UPDATESTOC.txt', 'updates')
 print(f'Anonymous login succeeded, retrieved UPDATESTOC.txt')
 
 # Retrieve CBTF1  
-threaded_download('pub/cbt/CBTF1.zip', 'CBTF1.zip')
+download_file('pub/cbt/CBTF1.zip', 'CBTF1.zip')
 print(f'Anonymous login succeeded, retrieved CBTF1.zip')
 # Unzip  
 try:
@@ -138,7 +112,7 @@ cbt = pd.DataFrame.from_dict(cbtinfo)
 cbt.to_pickle(f'{args.pickle}')
 print(f'Dataframe saved as {args.pickle}, {len(cbt)} CBT-files indexed')
 
-to_process = cbt.query(f'cbtnum == True') if args.updates else cbt # Only process updated files if specified 
+to_process = cbt.query(f'updated == True') if args.updates else cbt # Only process updated files if specified 
 extra = "Only processing files with the update flag." if args.updates else "" 
 extra2 = "(Forcing download, not comparing remote/local filesizes)." if args.force else ""
 
@@ -147,7 +121,6 @@ print(f'\nProcessing {len(to_process)} files. {extra} {extra2}\n')
 threads = []
 i = 0
 for index, data in to_process.iterrows():
-    print(data['cbtnum'])
     i += 1
     pct = math.floor((i/len(to_process))*100)
     done = math.floor((pct/100)*40)
@@ -184,7 +157,7 @@ for index, data in to_process.iterrows():
         print(f'{done}{todo} {fname} ({pct}%) [downloading, active threads={threading.active_count()}]', end='\r', flush=True)
         while threading.active_count() >= args.threads:
             time.sleep(0.5)
-        t = threading.Thread(target=threaded_download, args=(fname, stagefile))
+        t = threading.Thread(target=download_file, args=(fname, stagefile))
         threads.append(t)
         t.start()
     else:

@@ -19,8 +19,9 @@ import subprocess
 
 # Global variables
 CONFIG_FILE = "config.yml"
-# Don't contain .DATA files 
-SKIP = ["CBT001", "CBT002", "CBT003", "CBT004", "CBT005", "CBT007", "CBT018", "CBT061", "CBT063", "CBT064", "CBT110", "CBT157", "CBT230"] 
+# Don't process since they contain .DATA files 
+SKIP = ["CBT001", "CBT002", "CBT003", "CBT004", "CBT005", "CBT007", "CBT018", 
+        "CBT061", "CBT063", "CBT064", "CBT110", "CBT157", "CBT230"] 
 
 # Configure logfile info
 logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
@@ -33,12 +34,20 @@ logging.basicConfig(
 
 # Suppress xmi logging info
 logging.getLogger("xmi").setLevel(logging.WARNING)  # Prevent DEBUG logs
-logging.getLogger("xmi").propagate = False  # Ensure xmi logs don’t pass to root
+logging.getLogger("xmi").propagate = False  # So xmi logs don’t pass to root
 # Create main logger
 logger = logging.getLogger(__name__)
 
 class XMIObject:
+    """Class to deal with XMI files."""
     def __init__(self, name, xmi_file, parent = None):
+        """Initialize a new XMIObject instance.
+        
+        Parameters:
+        name (str): The name of the instance.
+        xmi_file (str): Full path to to the XMI file.
+        parent (XMIObject): The parent object of this instance. Defaults to None. 
+        """
         self.name = name
         self.xmi_file = xmi_file    
         self.parent = parent 
@@ -55,7 +64,6 @@ class XMIObject:
         self.loglines = [] # For cbt2git log 
         xmi_filename = xmi_file.split('/')[-1]
         self.loglines.append(f'{datetime.datetime.now()} - Received {filename} from {xmi_filename} ' + '\n')
-        self.zigidsn = (f'{filename} PO FB 80 32720' + "\n")
 
         if (self.xmi_obj.is_pds(filename)):
             self.zigispf = {}
@@ -72,22 +80,27 @@ class XMIObject:
                 # Create folder for .zigi files 
                 zigi_dir = f"{self.repopath}/.zigi"
                 os.makedirs(zigi_dir, exist_ok = True) 
-                # Create .zigi/dsn file 
-                with open(f"{zigi_dir}/dsn", "w") as file:
-                    file.write(self.zigidsn)
+                self.zigidsn = ''
 
+                # Rename parent zigifile to PDS
+                self.zigispf['PDS'] = self.zigispf.pop(self.name)
                 for f in self.zigispf:
                     # Create .zigi/name file for parent/any nested XMI's
                     with open(f"{zigi_dir}/{f}", "w") as file:
                         file.writelines(self.zigispf[f])
-                
+                    # add onto .zigi/dsn file 
+                    self.zigidsn += f'{f} P0 FB 80 32720' + "\n"
+
+                with open(f"{zigi_dir}/dsn", "w") as file:
+                    file.write(self.zigidsn)
+
                 self.success = True
             
             else:
                 # If nested, add loglines to parent loglines 
                 parent.loglines.extend(self.loglines)
                 # Add zigi info 
-                parent.zigidsn += self.zigidsn
+                zigi_name = self.name.split('/')[-1]
                 parent.zigispf[self.name.split('/')[1]] = self.zigispf[self.name]
             
             shutil.rmtree(f"/tmp/{self.pds}") # Remove PDS directory in /tmp
@@ -99,15 +112,14 @@ class XMIObject:
             xmi_member = XMIMember(filename, info, self) # Create new member 
             if parent:
                 parent.loglines.extend(self.loglines)
-                parent.zigidsn += self.zigidsn
                 parent.zigispf[self.name.split('/')[1]] = xmi_member.ispfline
-
             else:
                 logger.info("Is there any like this?")
             os.remove(f"/tmp/{filename}{xmi_member.extension}") # Remove file from previous location
 
         # Remove xmi_file from /tmp folder
         os.remove(self.xmi_file)  
+
     def extract_xmi(self):
         """Opens the XMI file and extracts its contents."""
         try:
@@ -142,7 +154,7 @@ class XMIObject:
 
     def create_members(self):
         """Creates a child XMIMember for each member """
-        # xmi_members = self.xmi_obj.get_members(self.pds)
+        # Get all the members and info associated with each member
         xmi_members = json.loads(self.xmi_obj.get_json()).get('file').get(self.pds).get('members')
         if not self.parent:
             pds_folder = f'{self.repopath}/PDS'
@@ -178,7 +190,15 @@ class XMIObject:
                     XMIObject(f'{self.name}/{m}', f'/tmp/{self.pds}/{m}.xmi', self)
 
 class XMIMember:
+    """Class to deal with the members of an XMI file."""
     def __init__(self, name, info, parent):
+        """Initialize a new XMIMember instance.
+        
+        Parameters:
+        name (str): The name of the instance.
+        info (dict): Member info for this instance.
+        parent (XMIObject): The parent object of this instance. 
+        """
         self.name = name
         self.pds = getattr(parent, 'pds', '')
         self.parent = parent
@@ -200,6 +220,7 @@ class XMIMember:
         self.ispfstats()
     
     def ispfstats(self):
+        """Sets ispf stats for each member."""
         # Set creation date 
         crdat = self.ispf.get('createdate').split('T')[0][2:].replace('-','/')
 
@@ -223,7 +244,7 @@ class XMIMember:
         self.ispfline =  f"{self.name:<8} {crdat} {mddat} {v:>2} {m:>2} {mdtime} {olines:>5} {nlines:>5} {0:>5} {self.ispf.get('user')}\n"
         
     def move_member(self):
-        """Move member file to destination directory based on mimetype"""
+        """Move member file to the destination directory in .cbtrepos based on mimetype"""
         in_pds = hasattr(self.parent, 'pds')
         nested = getattr(self.parent, 'parent', '')
 
@@ -326,7 +347,12 @@ def parse_arguments():
     return args
 
 def copy_file(src, dst): 
-    """Copies src to dst if new or different.""" 
+    """Copies src to dst if new or different.
+    
+    Arguments:
+    src (str): Source file path.
+    dst (str): Destination file path.
+    """ 
     if os.path.isfile(src):
         if not os.path.exists(dst) or not filecmp.cmp(src, dst):
             shutil.copyfile(src, dst)
@@ -339,7 +365,10 @@ def copy_file(src, dst):
         return None
 
 def unzip_xmi(cbt_zip):
-    """Unzip CBT zipfile and extract contents to /tmp. Returns extracted XMI file."""
+    """Unzip CBT zip file and extract contents to /tmp. Returns extracted XMI file.
+    
+    arguments:
+    cbt_zip (str): Path to the CBT zip file to unzip."""
     try:
         zip_ref = zipfile.ZipFile(cbt_zip, 'r')
     except Exception as e: 
@@ -366,7 +395,7 @@ def unzip_xmi(cbt_zip):
     return xmi_file
 
 def readme_file(reponame):
-    """Create README file for the repository."""
+    """Create README file for the repository specified by reponame."""
     repopath = f'{repos}/{reponame}'
     # Create README file 
     files  = glob.glob(f'{repopath}/PDS/@FIL*')
@@ -407,7 +436,7 @@ This is still a work in progress. GitHub repos will be deleted and created durin
         file.write(readme)
 
 def git_attributes(reponame):
-    """Create .gitattributes file for the repository."""
+    """Create .gitattributes file for the repository specified by reponame."""
     repopath = f'{repos}/{reponame}'
     attributes=f"""*                git-encoding=iso8859-1 zos-working-tree-encoding=ibm-1047 
 .gitattributes    git-encoding=iso8859-1 zos-working-tree-encoding=iso8859-1
