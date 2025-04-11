@@ -1,190 +1,444 @@
-#!/bin/env python
-
-from ftplib import FTP
-import parse
-import re
-import pandas as pd
+import argparse
 import os
-import zipfile, io 
-import xmi, json
+import math
+import shutil
+import logging
+import filecmp
+import math
 import time
 import datetime
-
-import subprocess
-import glob
-
-import math
+import xmi, json
+import pandas as pd
+import zipfile
 import yaml
-import shlex
+from github import Github, GithubException
+import requests
+import glob
+import re
+import subprocess
 
-import argparse 
-import subprocess 
+# Global variables
+CONFIG_FILE = "config.yml"
+# Don't process since they contain .DATA files 
+SKIP = ["CBT001", "CBT002", "CBT003", "CBT004", "CBT005", "CBT007", "CBT018", 
+        "CBT061", "CBT063", "CBT064", "CBT110", "CBT157", "CBT230"] 
 
-import pprint
+# Configure logfile info
+logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
+logging.basicConfig(
+    filename=logfile,  
+    filemode="w", 
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
+# Suppress xmi logging info
+logging.getLogger("xmi").setLevel(logging.WARNING)  # Prevent DEBUG logs
+logging.getLogger("xmi").propagate = False  # So xmi logs don’t pass to root
+# Create main logger
+logger = logging.getLogger(__name__)
 
-parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter, description="""Create, or update a GitHub profile with data from CBTTape.org.
+class XMIObject:
+    """Class to deal with XMI files."""
+    def __init__(self, name, xmi_file, parent = None):
+        """Initialize a new XMIObject instance.
+        
+        Parameters:
+        name (str): The name of the instance.
+        xmi_file (str): Full path to to the XMI file.
+        parent (XMIObject): The parent object of this instance. Defaults to None. 
+        """
+        self.name = name
+        self.xmi_file = xmi_file    
+        self.parent = parent 
 
-    1. Step One: Extract all CBTTapes and create GitHub Repo if needed.
-       Process all files that were downloaded from cbttape.org. All the zipfiles stored in the path you specify with --stage. are processed. They are copied to the --cbtrepos folder if
-they're new. If they're the same as  what's already present there, nothing happens :) Otherwise, they're new a repote repo
-at GITHUB_NAME_OR_ORG from config.yaml will be created.
-Zip files are expaned to their containing PDS/SEQ. This PDS will be scanned, nested XMIT files will be expanded into the repo too.
-Binary files that do not resolve to a (paritioned) sequential file will be stored as a new xmit in the /xmits folder.""")
+        self.xmi_obj = self.extract_xmi()
+        if not self.xmi_obj:
+            # Return if there was an error extracting the XMI 
+            return None
 
-parser.add_argument("--stage", type=str,
-                    default=f'{os.getcwd()}/stage',
-                    help=f"""Full path to stage-foler. 
-This is where all zip files from cbttape.org were downloaded to.
-Defaults to {os.getcwd()}/stage""")
+        self.repopath = f'{repos}/{name}'
+        os.makedirs(self.repopath , exist_ok = True) # Create target directory
+        
+        filename  = self.xmi_obj.get_file() # Get the pds file 
+        self.loglines = [] # For cbt2git log 
+        xmi_filename = xmi_file.split('/')[-1]
+        self.loglines.append(f'{datetime.datetime.now()} - Received {filename} from {xmi_filename} ' + '\n')
 
-parser.add_argument("--cbtfiles", type=str,
-                    default=f'.cbtfiles',
-                    help=f"""Full path to the cbtfiles. 
-This is all up-to-date zip files (if you ran --update).
-Defaults to {os.getcwd()}/.cbtfiles""")
+        if (self.xmi_obj.is_pds(filename)):
+            self.zigispf = {}
+            self.zigispf[self.name] = []
+            # if the file is a PDS, set members as new XMIMembers
+            self.pds = filename
+            self.create_members() # get all members of the PDS
 
-parser.add_argument("--repos", type=str,
-                    default=f'.cbtrepos',
-                    help=f"""Full path to local repos folder. 
-Defaults to {os.getcwd()}/.cbtrepos""")
+            if not parent:
+                # create cbt2git log file if not nested
+                with open(f"{self.repopath}/cbt2git.log", "w") as file:
+                    file.writelines(self.loglines)
+                
+                # Create folder for .zigi files 
+                zigi_dir = f"{self.repopath}/.zigi"
+                os.makedirs(zigi_dir, exist_ok = True) 
+                self.zigidsn = ''
 
-parser.add_argument("--only", type=int,
-                    default=0,
-                    help=f"""Only process this CBT Tape""")
+                # Rename parent zigifile to PDS
+                self.zigispf['PDS'] = self.zigispf.pop(self.name)
+                for f in self.zigispf:
+                    # Create .zigi/name file for parent/any nested XMI's
+                    with open(f"{zigi_dir}/{f}", "w") as file:
+                        file.writelines(self.zigispf[f])
+                    # add onto .zigi/dsn file 
+                    self.zigidsn += f'{f} P0 FB 80 32720' + "\n"
 
-parser.add_argument("--pickle", type=str,
-                    default=f'.cbt.pkl',
-                    help=f"""Panda pickle file with parsed UPDATESTOC.txt information. Will be updated during this run. Defaults to .cbt.pkl""")
+                with open(f"{zigi_dir}/dsn", "w") as file:
+                    file.write(self.zigidsn)
 
-parser.add_argument("--clean",
-                    action="store_true",
-                    help=f"Cleans everything except stage folder. Does not take --only into account...")
-
-parser.add_argument("--force",
-                    action="store_true",
-                    help=f"Ingore filesizes, always download everything.")
-
-parser.add_argument("--noremote",
-                    action="store_true",
-                    help=f"Do everything, except remote GitHub actions. (doen't create or updates repos")
-
-
-
-
-args = parser.parse_args()
-
-
-repos    = args.repos 
-stage    = args.stage
-only     = args.only
-cbtfiles = args.cbtfiles
-pickle   = args.pickle
-noremote = args.noremote
-
-docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.oasis.opendocument.text','application/vnd.oasis.opendocument.text','application/vnd.ms-powerpoint','application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.presentationml.presentation']
-
-fulllog = []
-
-
-
-
-# No store user/pass in scripts lol
-# Get token via https://github.com/settings/tokens/
-# testing with GITHUB_TOKEN="6"
-
-with open('config.yml', 'r') as f:
-    config = yaml.safe_load(f)
-
-GITHUB_TOKEN = config['github']['token']
-GITHUB_USER_OR_ORG = config['github']['name']
-
-
-
-from github import Github
-github = Github(GITHUB_TOKEN)
-me = github.get_organization(GITHUB_USER_OR_ORG)
-
-
-if not noremote:
-    try:
-        GITHUB_USER = me.login
-    except:
-        print("Bad token... bad")
-        exit(4)
-
-    print(f"Token has logged on {github.get_user(GITHUB_USER).name} acting in github user/org github.com/{GITHUB_USER}")
-else:
-    print("Running locally only, no updates to GitHub")
-
-
-
-
-
-
-if args.clean:
-    """Removes all local and remote repositories. 
-    Basically a full hard reset
-    """
-    os.system(f'rm -rf {cbtfiles}/*')
-    os.system(f'rm -rf {repos}/*')
-    if not noremote:
-        print(f"{me.get_repos().totalCount} Repos ...")
-        while me.get_repos().totalCount > 1:
-            # Let's leave the discuss repo but remove all the rest...
-            for repo in me.get_repos():
-                if repo.name[:3] == "CBT":
-                    rate_used, rate_init = github.rate_limiting
-                    gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
-                    print(f"Deleting {repo.name:8} (gracetime={gracetime}, ratelimits={rate_used}/{rate_init})", end=' ', flush=True)
-                    r = me.get_repo(repo.name)
-                    #time.sleep(gracetime/24) 
-                    try:
-                        r.delete()
-                    except:
-                        print('Error????')
-                    print(f" ", end='          \r', flush=True)
-
-print('')
-
-
-if not os.path.isdir(repos):
-    os.mkdir(repos)
-
-if not os.path.isdir(cbtfiles):
-    os.mkdir(cbtfiles)
-
-
-
-
-
-cbt = pd.read_pickle(pickle)
-print(f'Loaded our dataframe, {len(cbt)} CBT-files ready to be processed')
-
-def ispfstatsfromxmi(mbr, xmijson):
-    if xmijson:
-        crdat = xmijson['createdate'].split('T')[0][2:].replace('-','/')
-        if xmijson['modifydate'] != '':
-            mddat = xmijson['modifydate'].split('T')[0][2:].replace('-','/')
-            mdtime = xmijson['modifydate'].split('T')[1].split('.')[0]
+                self.success = True
+            
+            else:
+                # If nested, add loglines to parent loglines 
+                parent.loglines.extend(self.loglines)
+                # Add zigi info 
+                zigi_name = self.name.split('/')[-1]
+                parent.zigispf[self.name.split('/')[1]] = self.zigispf[self.name]
+            
+            shutil.rmtree(f"/tmp/{self.pds}") # Remove PDS directory in /tmp
+        
         else:
-            # some pds-es have empty modifydate, we leave blank in ISPF stats 
+            # If not a PDS, add the file as the only member
+            logger.info(f"Adding {filename} as the only member of {self.name}")
+            info = self.xmi_obj.get_file_info_simple(filename) # Get file info 
+            xmi_member = XMIMember(filename, info, self) # Create new member 
+            if parent:
+                parent.loglines.extend(self.loglines)
+                parent.zigispf[self.name.split('/')[1]] = xmi_member.ispfline
+            else:
+                logger.info("Is there any like this?")
+            os.remove(f"/tmp/{filename}{xmi_member.extension}") # Remove file from previous location
+
+        # Remove xmi_file from /tmp folder
+        os.remove(self.xmi_file)  
+
+    def extract_xmi(self):
+        """Opens the XMI file and extracts its contents."""
+        try:
+            # Open XMI file 
+            xmi_obj = xmi.open_file(self.xmi_file, quiet = True)
+        except Exception as e:
+            logger.error(f"Error opening {self.xmi_file}: {str(e)}")
+            return None
+
+        try:
+            # Extract XMI file contents
+            xmi_obj.set_output_folder('/tmp')
+            xmi_obj.set_quiet(True)
+            xmi_obj.extract_all()
+        except Exception as e:
+            logger.error(f"Error extracting {self.xmi_file}: {str(e)}")
+            return None
+
+        try:
+            # Check if XMI file is empty
+            if not xmi.list_all(self.xmi_file):
+                # Empty or invalid XMI
+                logger.error(f"XMI file {self.xmi_file} is empty or invalid.")
+                return None
+        except Exception as e:
+            # Log an error if the file is not a valid XMI file
+            logger.error(f"Error processing {self.xmi_file} from {self.name}: {str(e)}")
+            return None
+        
+        logger.info(f"Received {self.xmi_file.split('tmp/')[1]} from {self.name}.")
+        return xmi_obj # Return the XMI object 
+
+    def create_members(self):
+        """Creates a child XMIMember for each member """
+        # Get all the members and info associated with each member
+        xmi_members = json.loads(self.xmi_obj.get_json()).get('file').get(self.pds).get('members')
+        if not self.parent:
+            pds_folder = f'{self.repopath}/PDS'
+            os.makedirs(pds_folder, exist_ok = True) # Create repo for PDS members
+        else:
+            pds_folder = self.repopath
+
+        for m, info in xmi_members.items():
+            # Iterate through each member in the PDS
+            if info.get('alias'):
+                # If the member is an alias
+                alias = self.xmi_obj.get_alias(self.pds, m)
+                try:
+                    # Create a symlink 
+                    os.symlink(alias, f'{pds_folder}/{m}')
+                except FileExistsError:
+                    logger.warning(f"Symlink {m} to {alias} already exists for {self.name}.")
+                except Exception as e:
+                    logger.error(f"Error creating alias {m} to {alias} in {self.pds} for {self.name}.")  
+                    continue
+
+                self.loglines.append(f'{datetime.datetime.now()} - Found alias {m} to {alias} in {self.pds}, moved to PDS/{m}' + '\n')
+
+            else:
+                # Otherwise create a new member
+                xmi_member = XMIMember(m, info, self)
+                if hasattr(xmi_member, 'ispfline'):
+                    # Add ispf stats if available
+                    self.zigispf[self.name].append(xmi_member.ispfline)
+
+                if info.get('mimetype') == 'application/xmit':
+                    # Create new XMIObject if member is an xmi file 
+                    XMIObject(f'{self.name}/{m}', f'/tmp/{self.pds}/{m}.xmi', self)
+
+class XMIMember:
+    """Class to deal with the members of an XMI file."""
+    def __init__(self, name, info, parent):
+        """Initialize a new XMIMember instance.
+        
+        Parameters:
+        name (str): The name of the instance.
+        info (dict): Member info for this instance.
+        parent (XMIObject): The parent object of this instance. 
+        """
+        self.name = name
+        self.pds = getattr(parent, 'pds', '')
+        self.parent = parent
+
+        for key, value in info.items():
+            # Set attributes based on info dict  
+            setattr(self, key, value)
+
+        # Set defaults if missing
+        setattr(self, 'mimetype', getattr(self, 'mimetype', 'application/octet-stream'))
+        setattr(self, 'extension', getattr(self, 'extension', '.bin'))
+
+        self.move_member()
+
+        # Add ispf stats (not sure if I should do this for all members or not)
+        if not getattr(self, 'ispf', ''):
+            self.ispf = {'version': '01.00', 'flags': 0, 'createdate': '1976-06-12T00:00:00.000000', 'modifydate': '1976-06-12T22:18:12.000000', 
+                         'lines': 0, 'newlines': 0, 'modlines': 0, 'user': 'CBT2GIT'}
+        self.ispfstats()
+    
+    def ispfstats(self):
+        """Sets ispf stats for each member."""
+        # Set creation date 
+        crdat = self.ispf.get('createdate').split('T')[0][2:].replace('-','/')
+
+        # Set modification date
+        if self.ispf.get('modifydate'):
+            mddat = self.ispf.get('modifydate').split('T')[0][2:].replace('-','/')
+            mdtime = self.ispf.get('modifydate').split('T')[1].split('.')[0]
+        else:
+            # If missing 
             mddat  = '        '
             mdtime = '        '
-        v     = int(xmijson['version'].split('.')[0])
-        m     = int(xmijson['version'].split('.')[1])
-        olines = int(xmijson['lines'])
-        nlines = int(xmijson['newlines'])
-        user   = xmijson['user']
-    else:
-        # weird that we need this? Probably calling ispfstatsfromxmi too eagerly?
-        fulllog.append(f"{datetime.datetime.now()} - ** ALERT CBT{cbtnum} ** {mbr} no ispfstats from xmi?" + "\n")
-        return f"{mbr:<8}"
-    ispfline =  f"{mbr:<8} {crdat} {mddat} {v:>2} {m:>2} {mdtime} {olines:>5} {nlines:>5} {0:>5} {user}"
-    return ispfline 
+        
+        # Set version
+        v = int(self.ispf.get('version').split('.')[0])
+        m = int(self.ispf.get('version').split('.')[1])
 
-def attribfile(path):
-    lines=f"""*                git-encoding=iso8859-1 zos-working-tree-encoding=ibm-1047 
+        # Set number of lines 
+        olines = int(self.ispf.get('lines'))
+        nlines = int(self.ispf.get('newlines'))
+
+        self.ispfline =  f"{self.name:<8} {crdat} {mddat} {v:>2} {m:>2} {mdtime} {olines:>5} {nlines:>5} {0:>5} {self.ispf.get('user')}\n"
+        
+    def move_member(self):
+        """Move member file to the destination directory in .cbtrepos based on mimetype"""
+        in_pds = hasattr(self.parent, 'pds')
+        nested = getattr(self.parent, 'parent', '')
+
+        if in_pds:
+            src_dir = f'/tmp/{self.pds}'
+        else:
+            src_dir = f'/tmp'
+        src = f'{src_dir}/{self.name}{self.extension}' # source filepath 
+        dst_dir = self.parent.repopath 
+
+        docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf', 
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.oasis.opendocument.text','application/vnd.oasis.opendocument.text',
+            'application/vnd.ms-powerpoint','application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation']
+        if self.mimetype in docmimetypes:
+            # For document types
+            doc_dir = f'{dst_dir}/docs'
+            dst = f'{doc_dir}/{self.name}{self.extension}'
+
+            os.makedirs(doc_dir , exist_ok = True) # Create directory for docs 
+            copy_file(src, dst)
+        
+        elif self.mimetype in ['application/zip', 'application/java-archive']:
+            # Zip files
+            dst = f'{dst_dir}/{self.name}' # Set file destination
+
+            try:
+                # Try to unzip 
+                with zipfile.ZipFile(src, 'r') as zip:
+                    try:
+                        zip.extractall(dst)
+                    except Exception as e:
+                        logger.error(f"ZIP {zip} in {self.pds} is not a zip file: {e}")                    
+            except Exception as e:
+                # Just copy file if unable to unzip 
+                logging.warning(f"Unable to unzip {zip} in {self.pds}, copying istead: {e}")
+                copy_file(src, dst)
+
+        elif self.mimetype == 'application/xmit':
+            # Copy with extension still present
+            if in_pds and not nested:
+                # If the member is in a PDS
+                dst = f'{dst_dir}/PDS/{self.name}{self.extension}' 
+            else:
+                dst = f'{dst_dir}/{self.name}{self.extension}' 
+            copy_file(src, dst)
+
+        else:
+            # Copy without extension still present
+            if in_pds and not nested:
+                # If the member is in a PDS
+                dst = f'{dst_dir}/PDS/{self.name}' 
+            else:
+                dst = f'{dst_dir}/{self.name}' 
+            copy_file(src, dst)
+        
+        dst_loc = dst.split(f'{repos}/')[1].split('/', 1)[1]
+        if not in_pds:
+            logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}), moved to {dst_loc}' + '\n'
+        else:
+            src_loc = src_dir.split('/tmp/')[1]
+            if self.mimetype == 'application.xmit':
+                logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}{self.extension}' + '\n'
+            else:
+                logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}' + '\n'
+        self.parent.loglines.append(logline)
+
+def parse_arguments():
+    """Parse all arguments."""
+    parser = argparse.ArgumentParser(formatter_class = argparse.RawTextHelpFormatter, 
+                                    description= "Extract CBTTapes and update a GitHub profile with data from CBTTape.org if needed.")
+    parser.add_argument("--stage", 
+                        type = str,
+                        default = f'{os.getcwd()}/stage',
+                        help=f"Full path to stage-folder where zip files from cbttape.org were downloaded to. Defaults to {os.getcwd()}/stage.")
+    parser.add_argument("--cbtfiles", 
+                        type = str,
+                        default = f'.cbtfiles',
+                        help=f"Full path to the cbtfiles. This is all up-to-date zip files (if you ran --update). Defaults to {os.getcwd()}/.cbtfiles.")
+    parser.add_argument("--repos", 
+                        type = str,
+                        default = f'.cbtrepos',
+                        help = f"Full path to local repos folder. Defaults to {os.getcwd()}/.cbtrepos.")
+    parser.add_argument("--only", 
+                        type = str,
+                        default = False,
+                        help = "Only process this CBT Tape (e.g. CBT010).")
+    parser.add_argument("--pickle", 
+                        type = str,
+                        default = f'.cbt.pkl',
+                        help = "Panda pickle file with parsed UPDATESTOC.txt information. Will be updated during this run. Defaults to .cbt.pkl")
+    parser.add_argument("--clean",
+                        action = "store_true",
+                        help = "Cleans everything except stage folder.")
+    parser.add_argument("--noremote",
+                        action="store_true",
+                        help=f"Do everything, except remote GitHub actions. (doen't create or updates repos")
+    args = parser.parse_args()
+    return args
+
+def copy_file(src, dst): 
+    """Copies src to dst if new or different.
+    
+    Arguments:
+    src (str): Source file path.
+    dst (str): Destination file path.
+    """ 
+    if os.path.isfile(src):
+        if not os.path.exists(dst) or not filecmp.cmp(src, dst):
+            shutil.copyfile(src, dst)
+        return dst
+    else:
+        logger.error(f"{src} not found.")
+        if only: 
+            # Stop if only processing one file 
+            exit(4)
+        return None
+
+def unzip_xmi(cbt_zip):
+    """Unzip CBT zip file and extract contents to /tmp. Returns extracted XMI file.
+    
+    arguments:
+    cbt_zip (str): Path to the CBT zip file to unzip."""
+    try:
+        zip_ref = zipfile.ZipFile(cbt_zip, 'r')
+    except Exception as e: 
+        logger.error(f"ZIP {cbt_zip} is not a zip file: {e}")
+        return None
+    
+    # Check that there is was only one file unzipped 
+    info = zip_ref.infolist()
+    if len(info) == 0:
+        logger.error(f"No files found in ZIP {zip}")
+        return None
+    if len(info) > 1:
+        logger.error(f"More than one file in ZIP {zip} => {', '.join([file.filename for file in info])}")
+        return None
+    
+    try: 
+        # Extract zip to /tmp directory
+        zip_ref.extractall('/tmp')
+    except Exception as e:
+        logger.error(f"Unable to extract ZIP {zip}: {e}")
+        return None
+    
+    xmi_file = f'/tmp/{info[0].filename}' # Get extracted XMI
+    return xmi_file
+
+def readme_file(reponame):
+    """Create README file for the repository specified by reponame."""
+    repopath = f'{repos}/{reponame}'
+    # Create README file 
+    files  = glob.glob(f'{repopath}/PDS/@FIL*')
+    if len(files) != 1:
+        logger.info(f"Creating readme file for {reponame} using info from CBTF1.txt.")
+        with open("CBTF1.txt", "r", encoding="Windows-1252", errors="replace") as f1:
+            lines = f1.readlines()
+        
+        cbtnum = reponame.split("CBT")[1]
+        if (len(cbtnum) == 3):
+            pattern = re.compile(fr"\*+   FILE {re.escape(cbtnum)}\b") # Regular expression to match "*   FILE {cbtnum}"
+        else:
+            pattern = re.compile(fr"\*+   FILE{re.escape(cbtnum)}\b")  # Regular expression to match "*   FILE{cbtnum}"
+
+        readme_lines= [line.strip() for line in lines if pattern.search(line)] # Filter lines matching the pattern
+        readme_content = '\n'.join(readme_lines)
+        readme_content = f"```\n{readme_content}\n```"
+
+        if not readme_content: 
+            # If no lines are found in CBT001 for the CBTTape
+            readme_content = 'echo "No @FILE in PDS"'
+            logger.info(f"No @FIL(E) detected for {reponame}, creating a README.md without extra info.")
+    else:
+        with open(files[0], 'r') as f:
+            readme_content = f.read()
+    
+        readme_content = f"```\n{readme_content}```" # Wrap in code block to avoid problems with slashes... 
+
+    readme = f"""# {reponame}
+Converted to GitHub via [cbt2git](https://github.com/wizardofzos/cbt2git)
+
+This is still a work in progress. GitHub repos will be deleted and created during this period...
+
+{readme_content}
+"""
+    # Write to README.md
+    with open(f"{repopath}/README.md", "w") as file:
+        file.write(readme)
+
+def git_attributes(reponame):
+    """Create .gitattributes file for the repository specified by reponame."""
+    repopath = f'{repos}/{reponame}'
+    attributes=f"""*                git-encoding=iso8859-1 zos-working-tree-encoding=ibm-1047 
 .gitattributes    git-encoding=iso8859-1 zos-working-tree-encoding=iso8859-1
 .gitignore        git-encoding=iso8859-1 zos-working-tree-encoding=iso8859-1
 *.docm binary
@@ -195,476 +449,299 @@ def attribfile(path):
 *.mobi binary
 *.azw3 binary
 *.pdf binary"""
-    with open(f'{path}/.gitattributes', 'w') as a:
-        a.writelines(lines)
 
-def getxmidata(xmifile):
-    xmijson = json.loads(xmi.open_file(xmifile,quiet=True).get_json())
-    try:
-        dsnam = xmijson['INMR02']['1']['INMDSNAM']
-    except:
+    # Write to .gitattributes file
+    with open(f"{repopath}/.gitattributes", "w") as file:
+        file.write(attributes)
+
+def create_git_repo(reponame):
+    """Creates new GitHub repo."""
+    retry_count = 0
+    max_retries = 5
+    while retry_count < max_retries:
+        # Retry if rate limits hit
+        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+        if rate_used >= rate_init * 0.9:  
+            # Check if close to hitting the rate limit 
+            time_to_wait = gracetime
+            time.sleep(time_to_wait + 1)  
         try:
-            dsnam = xmijson['INMR02']['2']['INMDSNAM']
-        except:
-            return False, False, False, False, False
-    dsorg = xmijson['INMR02']['1']['INMDSORG']
-    lrecl = xmijson['INMR02']['1']['INMLRECL']
-    if dsorg != "PS":
-        mbrs = [x for x in xmijson['file'][dsnam]['members']]
-    else:
-        mbrs = []
+            # Create new repo 
+            new_repo = GITHUB_USER.create_repo(reponame)
+            repourl = new_repo.ssh_url   
+            logger.info(f"Created GitHub repo {repourl}.")
+            time.sleep(10) # Sleep after repo creation
+            return repourl
+        
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Connection error while creating {reponame}, retrying: {e}")
+            wait_time = 30 * 2 * retry_count
+            time.sleep(wait_time)
+            retry_count += 1
+
+        except GithubException as e:
+            if e.status == 403 and "secondary rate limit" in str(e):
+                # Retry if secondary rate limit hit
+                logger.warning(f"Secondary rate limit hit while creating {reponame}, retrying: {e}")
+                wait_time = 30 * 2 * retry_count
+                time.sleep(wait_time)
+                retry_count += 1
+            else:
+                # Other errors 
+                logger.error(f"Error creating github repo {reponame}: {e}")
+                time.sleep(600)
+                return None
+        
+    # Failed after max retries 
+    logger.error(f"Unable to create github repo {reponame} due to rate limits.")
+    time.sleep(600)
+    return None  
+
+def commit_git_repo(reponame, repourl, remote_name="origin", branch="main"):
+    """Commits any updates from reponame to repourl."""
+    repopath = f'{repos}/{reponame}'
+
     try:
-        recfm  = xmijson['file'][dsnam]['COPYR1']['DS1RECFM']
-    except:
-        recfm = 'n.a.'
-    members = {}
-    for m in mbrs:
-        if 'mimetype' in xmijson['file'][dsnam]['members'][m]:
-            mt = xmijson['file'][dsnam]['members'][m]['mimetype']
+        # Ensure repository is initialized
+        if not os.path.isdir(os.path.join(repopath, ".git")):
+            subprocess.run(["git", "init", "--initial-branch=main", "--quiet"], cwd=repopath, check=True)
+
+        # Check if remote already exists
+        remote_url = subprocess.run(["git", "remote", "get-url", remote_name], cwd=repopath, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        current_url = remote_url.stdout.strip()
+        if current_url: 
+            if current_url != repourl:  
+                # Remove remote if it doesn't match the repourl
+                subprocess.run(["git", "remote", "remove", remote_name], cwd=repopath, check=True)
+                subprocess.run(["git", "remote", "add", remote_name, repourl], cwd=repopath, check=True)
         else:
-            mt = 'application/octet-stream' # force it :)
-        if 'datatype' in xmijson['file'][dsnam]['members'][m]:
-            dt = xmijson['file'][dsnam]['members'][m]['datatype']
-        else:
-            dt = 'binary'
-        if 'extension' in xmijson['file'][dsnam]['members'][m]:
-            ext = xmijson['file'][dsnam]['members'][m]['extension']
-        else:
-            ext = '.bin'
-        members[m] = {'mimetype': mt, 'datatype':dt,'ext':ext}
-    return dsnam, dsorg, lrecl, recfm, members
+            # Add remote if none exists
+            subprocess.run(["git", "remote", "add", remote_name, repourl], cwd=repopath, check=True)
+        
+        # Check if there are changes to commit
+        git_status = subprocess.run(["git", "status", "--porcelain"], cwd=repopath, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        changed_files = [line.split()[-1] for line in git_status.stdout.strip().split("\n") if line]
+        # Filter out cbt2git.log
+        non_log_changes = [f for f in changed_files if os.path.basename(f) != "cbt2git.log"]
+        #if not non_log_changes:
+        if not changed_files:
+            logger.info(f"No updates found for {repourl}.")
+            return
 
+        # Stage all changes
+        subprocess.run(["git", "add", "."], cwd=repopath, check=True)
 
+        # Commit changes
+        commit_message = f'Updates from cbttape.org ({datetime.datetime.now().strftime("%Y-%m-%d")})'
+        subprocess.run(["git", "commit", "-m", commit_message, "--quiet"], cwd=repopath, check=True)
 
+        # Push changes
+        subprocess.run(["git", "push", remote_name, branch, "--quiet", "--force"], cwd=repopath, check=True)
+        logger.info(f"Committed updates to GitHub repo {repourl}.")
 
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error running Git command for repo {repourl}: {e}")
+    return
 
+# Parse all arguments 
+args      = parse_arguments()
+repos     = args.repos 
+stage     = args.stage
+only      = args.only
+cbtfiles  = args.cbtfiles
+noremote  = args.noremote
 
-import filecmp
-import shutil
+if f"{only}" in SKIP:
+    print(f"{only} does not contain an XMI file.")
+    exit(4)
 
-toprocess= []
+if not noremote:
+    # Retrieve GitHub token 
+    with open(CONFIG_FILE, "r") as file:
+        config = yaml.safe_load(file)
+    GITHUB_TOKEN = config.get('token')
+    if not GITHUB_TOKEN:
+        print("Error: GitHub token not found in config.yml")
+        exit(4)
 
+    # Try logging in with given token 
+    try:
+        GITHUB_CLIENT = Github(GITHUB_TOKEN)
+        GITHUB_USER = GITHUB_CLIENT.get_user()
+        username = GITHUB_USER.login
+        print(f"Token has logged onto {GITHUB_USER} acting as GitHub user github.com/{username}")
 
-flist = os.listdir(stage)
+    except Exception as e:
+        print(f"Unable to log into GitHub: {e}")
+        exit(4)
 
-for i,filename in enumerate(flist):
-    # I've we selected a CBT, oly do that one
-    if only > 0:
-        cbtn = f"CBT{only:003d}.zip" 
+if args.clean:
+    # Remove local repositories
+    if only:
+        # Only delete the CBT repo indicated by only
+        os.system(f'rm -rf {cbtfiles}/{only}')
+        os.system(f'rm -rf {repos}/{only}')
+        print(f"Removed local repository: {only}")
+    else:
+        os.system(f'rm -rf {cbtfiles}/*')
+        os.system(f'rm -rf {repos}/*')
+        print("Removed all local repositories.")
+
+# Create repo/cbtfile directory if they don't exist
+os.makedirs(repos, exist_ok = True)
+os.makedirs(cbtfiles, exist_ok = True)
+
+# Read pickle
+cbt = pd.read_pickle(args.pickle)
+print(f"Loaded our dataframe, {len(cbt)} CBT-files ready to be processed.")
+
+# Get list of files to process
+to_process = []
+for index, filename in enumerate(os.listdir(stage)):
+    if only:
+        cbtn = f"{only}.zip" 
         if filename != cbtn: 
             continue
-    # otherwise process this src CBT file..
+
+    # Add path to copied file to list of CBT zips to process
     src = os.path.join(stage, filename)
-    # checking if it is a file
-    if os.path.isfile(src):
-        dst = os.path.join(cbtfiles, filename)
-        # copy to destintation if new or different
-        if not os.path.exists(dst) or not filecmp.cmp(src, dst):
-            shutil.copyfile(src, dst)
-            # and add to our list of things to do :)
-            toprocess.append(dst)
-    else:
-        print(f"Sorry, {src} not found. This really shouldn't happen.")
+    dst = os.path.join(cbtfiles, filename)
+    if copy_file(src, dst):
+        to_process.append(dst)
 
-print(f"Need to process {len(toprocess)} CBT zips")
-# Let's sort them :)
-toprocess = sorted(toprocess)
+if only and len(to_process) == 0:
+    print(f"CBT-file {only} not found.")
+    exit(4)
 
+print(f"Need to process {len(to_process)} CBT zips.")
 
-def replace_pds(reponame, pdsfolder, member, ext, newmember, newnestpds):
-    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-        xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI FILE'.center(55)}" +  "|\n")
-        xmipds.write(f"# |{'AND HAS DE-XMIED IT TO'.center(55)}" + "|\n")
-        newloc = reponame + "/" + newnestpds
-        xmipds.write(f"# |{newloc.center(55)}" + "|\n") 
-        xmipds.write(f"# |{'THE ORIGINAL XMI HAS MOVED TO'.center(55)}" + "|\n")
-        xmipds.write(f"# |{(reponame + '/' + member + ext).center(55)}" + "|\n") 
-        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+start = time.time()
 
-for i,z in enumerate(toprocess):
-    cbtnum = z.split('/CBT')[1].split('.')[0]
-    pct = math.floor((i/len(toprocess))*100) 
-    done = math.floor((pct/100)*40)
+for index, zip in enumerate(sorted(to_process)):
+    # Unzip CBT zips to extract XMI files
+    pct = math.floor((index / len(to_process)) * 100)
+    done = math.floor((pct / 100) * 40)
     todo = 40 - done
-    done = done * "✅" 
-    todo = todo * "🟩"
-    print(f'{done}{todo} {z} ({pct}%)', end='\r', flush=True)
-    dotzigispf = {} # list of lines per PDS in the repo for .zigi/{PDS} files (ISPFSTATS)
-    dotzigidsn = [] # list of lines for .zigi/dsn file
-    loglines = []
-    loglines.append(f'{datetime.datetime.now()} - Initialized conversion of CBT{cbtnum}' + '\n')
-    with zipfile.ZipFile(z, 'r') as zip_ref:
-        info =  zip_ref.infolist()
-        if len(info) > 1:
-            print(F"More than onze file in zip??? {z} => {info}")
-        else:
-            xmifile = f"/tmp/{info[0].filename}"
-            zip_ref.extractall('/tmp')
-            try:
-                contents = xmi.list_all(xmifile)
-            except:
-                fulllog.append(f"{datetime.datetime.now()} - ** ALERT CBT{cbtnum} **  {z} is zipped version of {xmifile} but that's no XMI??" + "\n")
-                continue
+    done_bar = "✅" * done
+    todo_bar = "🟩" * todo
 
-            if contents == []:
-                # FILE062 has this too ...
-                fulllog.append(f"{datetime.datetime.now()} - ** ALERT CBT{cbtnum} ** {z} unzipped to {xmifile} but that's not an XMI??" + "\n")
-                continue
+    name = zip.split('/')[1].split('.')[0]
+    if name in SKIP:
+        # Skip for CBT tapes that do not contain XMI files 
+        continue
+    
+    print(f'{done_bar}{todo_bar} Converting {zip} ({pct}%)           ', end='\r', flush=True)
+    logger.info(f"Initialized conversion of {name}.")
+    xmi_file = unzip_xmi(zip) # Extract XMI from zip 
 
-            pdsfile  = contents[0].split('(')[0]
+    if xmi_file:
+        # Create an XMIObject to create local repo if xmi was extracted from zip
+        xmi_obj = XMIObject(name, xmi_file)
+    else:
+        # Skip if unable to unzip
+        continue
 
-            try:
-                xmi_obj = xmi.open_file(xmifile,quiet=True)
-            except:
-                fulllog.append(f"{datetime.datetime.now()} - ** ALERT CBT{cbtnum} ** De-XMI error for {z}" + "\n")
-                continue
+    if hasattr(xmi_obj, 'success'):
+        # If creating local repo was successful
+        repopath = xmi_obj.repopath
+        logger.info(f"Added all members of {name} to {repopath}.")
+    else:
+        logger.error(f"Error moving members of {name}.")
+        continue
 
-            xmijson = xmi_obj.get_json()
-            new_repo = False
-            repopath = repos + "/" + z.split('/')[1].split('.')[0]
-            reponame = z.split('/')[1].split('.')[0]
-            if not os.path.isdir(repopath):
-                os.mkdir(repopath)
+    if not noremote:
+        if index != 0 and index % 10 == 0:
+            print(f'{done_bar}{todo_bar} Sleep for 30s ({pct}%)                             ', end='\r', flush=True)
+            time.sleep(30)
+
+        # Skip the GitHub steps if noremote specified
+        print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True)
+        readme_file(name) # Create README file
+        git_attributes(name) # Create .gitattributes file
+
+        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+        if rate_used >= rate_init * 0.9:  
+            # Check if close to hitting the rate limit 
+            time_to_wait = gracetime
+            print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
+            time.sleep(time_to_wait + 1)  
+
+        new_repo = False
+        try:
+            repo = GITHUB_USER.get_repo(name)
+            repourl = repo.ssh_url
+            logger.info(f"Repo {name} already exists.")
+        except GithubException as e:
+            if e.status == 404:
+                logger.info(f"Repo {name} does not exist.")
                 new_repo = True
-            xmi_obj.set_output_folder('/tmp')
-            xmi_obj.set_quiet(True)
-            try:
-                xmi_obj.extract_all()
-            except:
-                fulllog.append(f"{datetime.datetime.now()} - ** ALERT CBT{cbtnum} ** De-XMI error for {z}" + "\n")
+            else:
+                logger.error(f"Error getting GitHub repo {name}: {e}")
                 continue
-            # We have the dexmied file in /tmp/something lets see what's there
-            xmijson = json.loads(xmi_obj.get_json())
-            xmi_file = list(xmijson['file'].keys())[0]
-            xmi_has  = xmijson['file'][xmi_file]['COPYR1']['type']
-            if xmi_has != "PDS":
-                fulllog.append(f"{datetime.datetime.now()} - ** ALERT CBT{cbtnum} ** No PDS in {xmifile}" + "\n")
-                continue
-            loglines.append(f'{datetime.datetime.now()} - Received {pdsfile} from {info[0].filename} ' + '\n')
-            # Create our target PDS-folder in repopath
-            mainpds = xmi_file.split('.')[-1]
-            pdsfolder = repopath + "/" + mainpds # last qualifier should do
-            os.system(f"mkdir -p {pdsfolder}")
-            # add line to the .zigi/dsn file
-            dotzigidsn.append(f'{mainpds} PO FB 80 32720' + "\n")
-            # create placeholder for ISPFSTATS
-            dotzigispf[mainpds] = []
-            for member in xmijson['file'][xmi_file]['members']:
-                # Loop all members in the received PDS from 'main' XMI
-                member_info = xmijson['file'][xmi_file]['members'][member]
-                if 'mimetype' in member_info:
-                    mimetype = member_info['mimetype']
-                else:
-                    mimetype = 'application/octet-stream'
-                if 'extension' in member_info:
-                    ext = member_info['extension']
-                else:
-                    ext = '.bin'
-                newmember = member.split('.')[0]                
-                if mimetype.split('/')[0] == 'text':
-                    # we just copy this over inside our repopath
-                    # usssafe vai the single quotes :)
-                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{pdsfolder}/{newmember}' > /dev/null 2>&1")
-                    # add the ISPFSTATS 
-                    if not member_info['ispf']:
-                        member_info['ispf'] = {'version': '01.00', 'flags': 0, 'createdate': '1976-06-12T00:00:00.000000', 'modifydate': '1976-06-12T22:18:12.000000', 'lines': 0, 'newlines': 0, 'modlines': 0, 'user': 'CBT2GIT'}
-                    dotzigispf[mainpds].append(ispfstatsfromxmi(member, member_info['ispf'])+"\n")
-                    loglines.append(f'{datetime.datetime.now()} - Found {member}{member_info["extension"]} ({member_info["mimetype"]}) in {pdsfile}, moved to {mainpds}/{member}' + '\n')
-                elif mimetype == 'application/xmit':
-                    # we should assume this has no more nested xmi's and de-xmit it outside of the pds as a new pds
-                    # dexmi, move
-                    nested_content = xmi.list_all(f'/tmp/{pdsfile}/{member}{ext}')
-                    nested_pdsfile  = nested_content[0].split('(')[0] # last two qualifier should do all... 
-                    nested_xmi_obj = xmi.open_file(f'/tmp/{pdsfile}/{member}{ext}',quiet=True)
-                    nested_xmi_obj.set_output_folder(repopath)
-                    try:
-                        nested_xmi_obj.extract_all()
-                    except:
-                         # for 982, the XMI is 'broken' ?
-                        fulllog.append(f"{datetime.datetime.now()} - ** ALERT CBT{cbtnum} ** {pdsfile}/{member}{ext} no ispf data when de-xmi-ing" + "\n")
-                        continue
-                    # skip all but last 2 qualifiers
-                    newnestpds = '.'.join(nested_pdsfile.split('.')[-2:])
-                    loglines.append(f'{datetime.datetime.now()} - Found {member}{member_info["extension"]} ({member_info["mimetype"]}) in {pdsfile}'+ '\n')
-                    # move to correct spot
-                    res = os.system(f'mv {repopath}/{nested_pdsfile} {repopath}/{newnestpds} > /dev/null 2>&1')
-                    if res != 0:
-                        # when PS not PDS, there's a .txt so we just redo?
-                        os.system(f'mv {repopath}/{nested_pdsfile}.txt {repopath}/{newnestpds} > /dev/null 2>&1')
-
-                    newxmi = repopath + "/" + member + ext
-                    # add nested XMI to root of repo
-                    os.system(f'cp /tmp/{pdsfile}/{member}{ext} {newxmi} > /dev/null 2>&1')
-                    # chop off all dem extensions :)
-                    for f in glob.glob(f'{repopath}/{newnestpds}/*'):
-                        path, file = os.path.split(f)
-                        newfile = file.split('.')[0]  # breaks sortof if dots in membername..but that's impossible anyway :)
-                        noext = path + '/' + newfile
-                        # Deal with the dollars :)
-                        f = f.replace('$','\$')
-                        noext = noext.replace('$','\$')
-                        os.system(f'mv {f} {noext} > /dev/null 2>&1')
-
-                    # add ispfstats
-                    dotzigispf[newnestpds] = []
-                    nested_xmijson = json.loads(nested_xmi_obj.get_json())
-                    nested_xmi_file = list(nested_xmijson['file'].keys())[0]
-                    if not 'members' in nested_xmijson['file'][nested_xmi_file]:
-                        # TODO Phil: If no members, make the json have empty list for it?
-                        nested_xmijson['file'][nested_xmi_file]['members'] = []
-                    for nested_member in nested_xmijson['file'][nested_xmi_file]['members']:  
-                        nested_member_info = nested_xmijson['file'][nested_xmi_file]['members'][nested_member]
-                        dotzigispf[newnestpds].append(ispfstatsfromxmi(nested_member, nested_member_info['ispf'])+"\n")
-                        
-                    if 'COPYR1' in nested_xmijson:
-                        # FOR A PDS...
-                        print("NESTED PDS IN XMI XMI???? NEVER HAPPENS...")
-                        1/0
-                        for m in nested_xmijson['file'][nested_xmi_file]['members']:
-                            print(f"Calling ditzigispf for {m} {nested_xmijson['file'][nested_xmi_file]['members'][m]['ispf']}")
-                            dotzigispf[newnestpds].append(ispfstatsfromxmi(m, nested_xmijson['file'][nested_xmi_file]['members'][m]['ispf'])+"\n")
-                            loglines.append(f'{datetime.datetime.now()} - Found {m}{nested_xmijson["file"][nested_xmi_file]["members"][m]["extension"]} ({nested_xmijson["file"][nested_xmi_file]["members"][m]["mimetype"]}) in {member}{member_info["extension"]}, moved to {newnestpds}/{m}' + '\n')
-                        replace_pds(reponame, pdsfolder, member, ext, newmember, newnestpds)
-                        # add this member to the .zigi/<PDS> ispfstats, but change them...
-                        dd = datetime.datetime.now().strftime("%y/%m/%d")
-                        mm = datetime.datetime.now().strftime('%H:%M:%S')
-                        newispf = f"{member:<8} {dd} {dd} {1:>2} {0:>2} {mm} {7:>5} {7:>5} {0:>5} CBT2GIT"
-                        dotzigispf[mainpds].append(newispf + "\n")
-                        # add line to .zigi/dsn
-                        dotzigidsn.append(f'{newnestpds} PO FB 80 32720' + "\n")
-                    else:
-                        # Figure out .zigi/dsn from xmi ifo?
-                        lrecl = nested_xmijson['INMR02']['1']['INMLRECL']
-                        dsorg = nested_xmijson['INMR02']['1']['INMDSORG']
-                        recfm = nested_xmijson['INMR02']['1']['INMRECFM']
-                        blksz = nested_xmijson['INMR02']['1']['INMBLKSZ']
-                        if recfm != "U":
-                            ok = f'{repopath}/{newnestpds}'
-                            loglines.append(f'{datetime.datetime.now()}   - Received to {reponame}/{newnestpds}' + '\n')
-                            with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                                xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI FILE'.center(55)}" +  "|\n")
-                                xmipds.write(f"# |{'AND HAS RECEIVED IT TO'.center(55)}" + "|\n")
-                                newloc = reponame + "/" + newnestpds
-                                xmipds.write(f"# |{newloc.center(55)}" + "|\n") 
-                                xmipds.write(f"# |{'THE ORIGINAL XMI HAS MOVED TO'.center(55)}" + "|\n")
-                                xmipds.write(f"# |{(reponame + '/' + member + ext).center(55)}" + "|\n") 
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                            dd = datetime.datetime.now().strftime("%y/%m/%d")
-                            mm = datetime.datetime.now().strftime('%H:%M:%S')
-                            newispf = f"{member:<8} {dd} {dd} {1:>2} {0:>2} {mm} {7:>5} {7:>5} {0:>5} CBT2GIT"
-                            dotzigispf[mainpds].append(newispf + "\n")
-                            dotzigidsn.append(f'{ok.split("/")[-1]} {dsorg} {recfm} {lrecl} {blksz}' + "\n")
-                        else:
-                            # RECFM = U.... hmmm
-                            os.system(f"rm -rf {repopath}/{newnestpds}* > /dev/null 2>&1")  # dunno why I can't find where I copy it in the beginning, but it has to go
-                            os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}{member_info['extension']}' > /dev/null 2>&1") # as replaced with the XMI file
-                            del dotzigispf[newnestpds] # no ispf stats, as it's  not a PDS :)
-                            os.system(f"rm {repopath}/.zigi/{newnestpds} > /dev/null 2>&1") # get rid of earlier generated ispfstats too
-                            with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                                xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI FILE'.center(55)}" +  "|\n")
-                                xmipds.write(f"# |{'IT CONTAINED RECFM=U DATA'.center(55)}" + "|\n")
-                                newloc = reponame + "/" + newnestpds
-                                xmipds.write(f"# |{'---'.center(55)}" + "|\n") 
-                                xmipds.write(f"# |{'THE ORIGINAL XMI HAS MOVED TO'.center(55)}" + "|\n")
-                                xmipds.write(f"# |{(reponame + '/' + member + ext).center(55)}" + "|\n") 
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                            loglines.append(f'{datetime.datetime.now()}   - Received RECFM=U data, stored XMIT file as {reponame}/{member}{ext}' + '\n')
-                            dd = datetime.datetime.now().strftime("%y/%m/%d")
-                            mm = datetime.datetime.now().strftime('%H:%M:%S')
-                            newispf = f"{member:<8} {dd} {dd} {1:>2} {0:>2} {mm} {7:>5} {7:>5} {0:>5} CBT2GIT"
-                            dotzigispf[mainpds].append(newispf + "\n")
-
-
+        except requests.exceptions.ConnectionError as e:
+            # Why does this keep happening...
+            logger.error(f"Connection error while creating {repo}: {e}")
+            time.sleep(600)
+            continue
                     
+        if not new_repo and args.clean:
+            # Remove repo if clean specified
+            rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+            gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+            if rate_used >= rate_init * 0.9:  
+                # Check if close to hitting the rate limit 
+                time_to_wait = gracetime
+                print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
+                time.sleep(time_to_wait + 1)  
 
+            print(f'{done_bar}{todo_bar} Deleting GitHub repo {name} ({pct}%)            ', end='\r', flush=True)
+            try: 
+                repo.delete()
+                new_repo = True
+                time.sleep(15)
+                logger.info(f"Removed Github repo {repourl}.")
+            except Exception as e:
+                logger.error(f"Error deleting Github repo {repourl}: {e}")
 
-                elif mimetype in docmimetypes:
-                    # create the docs folder and move there
-                    target = f'{repopath}/docs'
-                    os.system(f'mkdir -p {target}')
-                    # extract xmi to target
-                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{target}/{member}{ext}' > /dev/null 2>&1")
-                    loglines.append(f'{datetime.datetime.now()} - De-xmi-ed {member} to {reponame}/docs/{member}{ext}'+ '\n')
-                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                                xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                                xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
-                                xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                                xmipds.write(f"# |{'De-XMI-ed data STORED AS'.center(55)}" + "|\n")
-                                place = f'{reponame}/docs/{member}{ext}'
-                                xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                                xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+        if new_repo: 
+            # If repository does not exist, create a new one
+            print(f'{done_bar}{todo_bar} Creating GitHub repo {name} ({pct}%)            ', end='\r', flush=True)
+            repourl = create_git_repo(name)
+            time.sleep(15)
+            if not repourl:
+                # Continue if problems creating git repo
+                continue
+        
+        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+        if rate_used >= rate_init * 0.9:  
+            # Check if close to hitting the rate limit 
+            time_to_wait = gracetime
+            print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
+            time.sleep(time_to_wait + 1)  
 
-                elif mimetype == 'application/zip':
-                    target = f'{repopath}/{member}'
-                    canunzip = True
-                    loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} ({mimetype}), trying to unzip'+ '\n')
-                    try:
-                        with zipfile.ZipFile(f'/tmp/{pdsfile}/{member}{ext}', 'r') as inner_zip:
-                            loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} ({mimetype}), extracting to {reponame}/{member}'+ '\n')
-                        
-                            try:
-                                inner_zip.extractall(target)
-                            except Exception as e:
-                                # This happens in CBT432 : zipfile.BadZipFile: Bad CRC-32 for file 'VB40016.DLL'
-                                # This happens in BBT990 : zipfile.BadZipFile: File is not a zip file (for DEVTIPS@.zip)
-                                loglines.append(f'{datetime.datetime.now()}   - {e}'+ '\n')
-                    except Exception as e:
-                        loglines.append(f'{datetime.datetime.now()}   - {e}, kept as member'+ '\n')
-                        canunzip = False
-                 
-                    if canunzip:
-                        with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                            xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                            xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                            xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
-                            xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                            xmipds.write(f"# |{'RECEIVED AND UNZIPPED TO'.center(55)}" + "|\n")
-                            place = f'{reponame}/{member}'
-                            xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                            xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                    else:
-                        # weird stuff (990) just keep da member
-                        os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{pdsfolder}/{newmember}' > /dev/null 2>&1")
+        print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True) 
+        commit_git_repo(name, repourl) # Commit updates 
+        time.sleep(15)
 
-                elif mimetype in ['application/java-archive', 'message/rfc822']:
-                    target = f'{repopath}/{member}'
-                    os.system(f'mkdir -p {target}')
-                    os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{target}/{member}{ext}' > /dev/null 2>&1")
-                    loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} ({mimetype}), moved to {reponame}/{member}{ext}'+ '\n')
-                    with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                        xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                        xmipds.write(f"# |{'AN DOCUMENT MIME-TYPE'.center(55)}" + "|\n")
-                        xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                        xmipds.write(f"# |{'RECEIVED MOVED TO'.center(55)}" + "|\n")
-                        place = f'{reponame}/{member}{ext}'
-                        xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                        xmipds.write(f"# +-------------------------------------------------------+" + "\n")
+        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+        if gracetime > 0:
+            print(f'{done_bar}{todo_bar} Rate critical ({rate_used}/{rate_init}), gracetime={gracetime} ({pct}%) '   , end='\r', flush=True)
+            time.sleep(gracetime*3)
+    
+    logger.info(f"Completed conversion of {name}.")
 
-                else:
-                    loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {mainpds}/{member}'+ '\n')
-                    res = os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{pdsfolder}/{member}' > /dev/null 2>&1") # as replaced with the XMI file
-                    # loglines.append(f'{datetime.datetime.now()} - Found {member}{ext} containing {mimetype}, moved to {reponame}/{member}{ext}'+ '\n')
-                    # os.system(f"cp '/tmp/{pdsfile}/{member}{ext}' '{repopath}/{member}{ext}' > /dev/null 2>&1") # as replaced with the XMI file
-                    # with open(f"{pdsfolder}/{newmember}",'w') as xmipds:
-                    #             xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-                    #             xmipds.write(f"# |{'CBT2GIT DETECTED THIS WAS AN XMI CONTAINING'.center(55)}" +  "|\n")
-                    #             xmipds.write(f"# |{'AN UNSUPPORTED MIME-TYPE'.center(55)}" + "|\n")
-                    #             xmipds.write(f"# |{mimetype.center(55)}" + "|\n") 
-                    #             xmipds.write(f"# |{'XMI data STORED AS'.center(55)}" + "|\n")
-                    #             place = f'{reponame}/{member}.xmi'
-                    #             xmipds.write(f"# |{place.center(55)}" + "|\n") 
-                    #             xmipds.write(f"# +-------------------------------------------------------+" + "\n")
-
-
-            # Also get the @FILEnnn into README
-            files  = glob.glob(repopath + f"/*{mainpds}/@FIL*")
-            # sanity check. There should be only one match
-            if len(files) != 1:
-                cccc = 'echo "No @FILE in PDS?"'
-                loglines.append(f'{datetime.datetime.now()} - No @FILExxx or @FILxxxx detected, creating README.md without extra info'+ '\n')
-            else:
-                cccc = f'cat {files[0]}'
-
-            # Now this is ugly as MD... so do some magix with it
-            nl = "\n"
-            os.system(f'echo "# {reponame}{nl}Converted to GitHub via [cbt2git](https://github.com/wizardofzos/cbt2git)" > {repopath}/README.md')
-            os.system(f'echo "This is still a work in progress. GitHub repos will be deleted and created during this period..." >> {repopath}/README.md')
-            os.system(f'echo "~~~~~~~~~~~~~~~~{nl}" >> {repopath}/README.md')
-            os.system(f'{cccc} >> {repopath}/README.md')
-            os.system(f'echo "~~~~~~~~~~~~~~~~{nl}" >> {repopath}/README.md')
-
-            # all parsed, write zigi files to repo (replaces existing...and that's what we want)
-            os.system(f'mkdir {repopath}/.zigi')
-            with open(f'{repopath}/.zigi/dsn', 'w') as dsnfile:
-                dsnfile.writelines(dotzigidsn)
-            for p in dotzigispf:
-                with open(f'{repopath}/.zigi/{p}', 'w') as ispffile:
-                    ispffile.writelines(dotzigispf[p])
-
-            # Do the thing with the pdf's docx et-al
-
-            # Append to logfile if we have one, otherwise create it
-            with open(f'{repopath}/cbt2git.log', 'a+') as dalog:
-                dalog.writelines(loglines)
-            
-            if new_repo:
-                # do_inital_add_commit_if_first :)
-                # cbt data via cbt.loc[cbt.cbtnum==cbtnum]['comment'].values[0]
-                os.system(f'cd {repopath} && git init --quiet')
-                os.system(f'cd {repopath} && git branch -M main --quiet')
-                attribfile(repopath)
-                msg = f"{z.split('/')[1].split('.')[0]} : Initial commit"
-                os.system(f'cd {repopath} && git add .')
-                os.system(f'cd {repopath} && git commit -m "{msg}" --quiet')
-            else:
-                # we're newer, so update the things..
-                os.system(f'cd {repopath} && git add . ')
-                os.system(f'cd {repopath} && git commit -m "Updates from cbttape.org ({datetime.datetime.now().strftime("%Y-%m-%d")})" --quiet')
-            
-            create_repo = False
-            
-            if not noremote:
-                try:
-                    repo = github.get_repo(f'{GITHUB_USER}/{reponame}')
-                except:
-                    create_repo = True
-                if create_repo:
-                    # create the repo at the github site, check for breakage...
-                    try:
-                        me.create_repo(
-                            reponame,
-                            private=False,
-                            description=cbt.loc[cbt.cbtnum==cbtnum]['comment'].values[0]
-                        )
-                    except:
-                        print("** SOMETHING BAD WHEN CREATING REPO (RATE LIMITS?)")
-                        logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
-                        with open(logfile, 'w') as biglog:
-                            biglog.writelines(fulllog)
-                        # then sleep for long, so I get to keep this running unattended!
-                        time.sleep(600)
-                        continue
-
-                    # sleep a bit....... github seems to lag on creation?
-                    time.sleep(10) # just to be sure :)
-                    repourl = f'git@github.com:cbttape/{reponame}.git' 
-                    repourl = me.get_repo(reponame).ssh_url                   
-                    os.system(f'cd {repopath} && git remote add origin {repourl}')
-                    os.system(f'cd {repopath} && git push -u origin main --quiet')
-
-                # repo was there, we can justpush our updates
-                os.system(f'cd {repopath} && git push origin main --quiet')
-                rate_used, rate_init = github.rate_limiting
-                gracetime = (github.rate_limiting_resettime-math.floor(time.time())) / 1000
-                print(f"Rate critical? ({rate_used}/{rate_init}), gracetime={gracetime}")
-                if gracetime > 0:
-                    print(f'Sleep for twice the grace time...{gracetime*2} secs')
-                    time.sleep(gracetime*2)
-                
-                if i % 10 == 0 and only == 0:
-                    # every 10, and not if we running just one...
-                    # print("Sleep another 30secs every 10 repos...")
-                    print("sleep for 30...")
-                    time.sleep(30)
-    # add log from this conersion to main full log
-    fulllog += loglines
-    # cleanup /tmp stuff
-    os.system(f'rm -rf /tmp/{pdsfile}')
-    os.system(f'rm -rf /tmp/{xmifile}')
-
-# sort on datetime (as we have extra messages in it from fulllog.append warnings that don't show in repo)
-fulllog = sorted(fulllog)
-logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
-with open(logfile, 'w') as biglog:
-    biglog.writelines(fulllog)
-
-# nice closing status-progress-bar-thunny
 done = 40 * "✅" 
 pct = 100
 z=''
-print(f'{done} {z} ({pct}%)', flush=True)
+print(f'{done} {z} ({pct}%)                                                  ', flush=True)
+
+stop = time.time()
+if not noremote:
+    print(f'All requested CBT files converted to Github repos in github.com/{username}.')
+else:
+    print(f'All requested CBT files converted and moved to {repos}')
+print(f'This operation took {datetime.timedelta(seconds=stop-start)}')
