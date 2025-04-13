@@ -459,44 +459,41 @@ def create_git_repo(reponame):
     retry_count = 0
     max_retries = 5
     while retry_count < max_retries:
-        # Retry if rate limits hit
         rate_used, rate_init = GITHUB_CLIENT.rate_limiting
-        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
-        if rate_used >= rate_init * 0.9:  
-            # Check if close to hitting the rate limit 
-            time_to_wait = gracetime
-            time.sleep(time_to_wait + 1)  
+        gracetime = (GITHUB_CLIENT.rate_limiting_resettime - math.floor(time.time())) / 1000
+        if rate_used >= rate_init * 0.9:
+            time.sleep(gracetime + 1)
+
         try:
-            # Create new repo 
-            new_repo = GITHUB_USER.create_repo(reponame)
-            repourl = new_repo.ssh_url   
+            new_repo = GITHUB_OWNER.create_repo(
+                name=reponame,
+                private=False,
+                auto_init=False,
+                description=f"CBT Tape {reponame} converted with cbt2git"
+            )
+            repourl = new_repo.ssh_url
             logger.info(f"Created GitHub repo {repourl}.")
-            time.sleep(10) # Sleep after repo creation
+            time.sleep(10)
             return repourl
-        
+
         except requests.exceptions.ConnectionError as e:
             logger.warning(f"Connection error while creating {reponame}, retrying: {e}")
-            wait_time = 30 * 2 * retry_count
-            time.sleep(wait_time)
+            time.sleep(30 * 2 * retry_count)
             retry_count += 1
 
         except GithubException as e:
             if e.status == 403 and "secondary rate limit" in str(e):
-                # Retry if secondary rate limit hit
                 logger.warning(f"Secondary rate limit hit while creating {reponame}, retrying: {e}")
-                wait_time = 30 * 2 * retry_count
-                time.sleep(wait_time)
+                time.sleep(30 * 2 * retry_count)
                 retry_count += 1
             else:
-                # Other errors 
                 logger.error(f"Error creating github repo {reponame}: {e}")
                 time.sleep(600)
                 return None
-        
-    # Failed after max retries 
+
     logger.error(f"Unable to create github repo {reponame} due to rate limits.")
     time.sleep(600)
-    return None  
+    return None
 
 def commit_git_repo(reponame, repourl, remote_name="origin", branch="main"):
     """Commits any updates from reponame to repourl."""
@@ -557,24 +554,33 @@ if f"{only}" in SKIP:
     exit(4)
 
 if not noremote:
-    # Retrieve GitHub token 
     with open(CONFIG_FILE, "r") as file:
         config = yaml.safe_load(file)
     GITHUB_TOKEN = config.get('token')
-    if not GITHUB_TOKEN:
-        print("Error: GitHub token not found in config.yml")
+    GITHUB_NAME = config.get('name')
+
+    if not GITHUB_TOKEN or not GITHUB_NAME:
+        print("Error: GitHub token or name not found in config.yml")
         exit(4)
 
-    # Try logging in with given token 
     try:
         GITHUB_CLIENT = Github(GITHUB_TOKEN)
-        GITHUB_USER = GITHUB_CLIENT.get_user()
-        username = GITHUB_USER.login
-        print(f"Token has logged onto {GITHUB_USER} acting as GitHub user github.com/{username}")
 
+        try:
+            GITHUB_OWNER = GITHUB_CLIENT.get_organization(GITHUB_NAME)
+            is_org = True
+        except GithubException as e:
+            if e.status == 404:
+                GITHUB_OWNER = GITHUB_CLIENT.get_user()
+                is_org = False
+            else:
+                raise
+
+        print(f"Token has logged into GitHub as {'organization' if is_org else 'user'}: {GITHUB_OWNER.login}")
     except Exception as e:
         print(f"Unable to log into GitHub: {e}")
         exit(4)
+    username = GITHUB_OWNER.login
 
 if args.clean:
     # Remove local repositories
@@ -670,7 +676,7 @@ for index, zip in enumerate(sorted(to_process)):
 
         new_repo = False
         try:
-            repo = GITHUB_USER.get_repo(name)
+            repo = GITHUB_OWNER.get_repo(name)
             repourl = repo.ssh_url
             logger.info(f"Repo {name} already exists.")
         except GithubException as e:
