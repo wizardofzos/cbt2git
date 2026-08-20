@@ -7,11 +7,24 @@ import filecmp
 import math
 import time
 import datetime
+import tempfile
+import sys
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 import xmi, json
 import pandas as pd
 import zipfile
 import yaml
-from github import Github, GithubException
 import requests
 import glob
 import re
@@ -22,6 +35,12 @@ CONFIG_FILE = "config.yml"
 # Don't process since they contain .DATA files 
 SKIP = ["CBT001", "CBT002", "CBT003", "CBT004", "CBT005", "CBT007", "CBT018", 
         "CBT061", "CBT063", "CBT064", "CBT110", "CBT157", "CBT230"] 
+
+# Module-level globals referenced across helper functions
+repos = ".cbtrepos"
+only = False
+GITHUB_CLIENT = None
+GITHUB_OWNER = None
 
 # Configure logfile info
 logfile = f'cbt2git-log-{datetime.datetime.now().strftime("%Y-%j-%H-%M-%S")}'
@@ -103,7 +122,9 @@ class XMIObject:
                 zigi_name = self.name.split('/')[-1]
                 parent.zigispf[self.name.split('/')[1]] = self.zigispf[self.name]
             
-            shutil.rmtree(f"/tmp/{self.pds}") # Remove PDS directory in /tmp
+            pds_tmp = os.path.join(tempfile.gettempdir(), self.pds)
+            if os.path.exists(pds_tmp):
+                shutil.rmtree(pds_tmp, ignore_errors=True)
         
         else:
             # If not a PDS, add the file as the only member
@@ -115,10 +136,13 @@ class XMIObject:
                 parent.zigispf[self.name.split('/')[1]] = xmi_member.ispfline
             else:
                 logger.info("Is there any like this?")
-            os.remove(f"/tmp/{filename}{xmi_member.extension}") # Remove file from previous location
+            member_tmp = os.path.join(tempfile.gettempdir(), f"{filename}{xmi_member.extension}")
+            if os.path.exists(member_tmp):
+                os.remove(member_tmp)
 
-        # Remove xmi_file from /tmp folder
-        os.remove(self.xmi_file)  
+        # Remove xmi_file from temp folder
+        if os.path.exists(self.xmi_file):
+            os.remove(self.xmi_file)  
 
     def extract_xmi(self):
         """Opens the XMI file and extracts its contents."""
@@ -131,7 +155,7 @@ class XMIObject:
 
         try:
             # Extract XMI file contents
-            xmi_obj.set_output_folder('/tmp')
+            xmi_obj.set_output_folder(tempfile.gettempdir())
             xmi_obj.set_quiet(True)
             xmi_obj.extract_all()
         except Exception as e:
@@ -149,7 +173,7 @@ class XMIObject:
             logger.error(f"Error processing {self.xmi_file} from {self.name}: {str(e)}")
             return None
         
-        logger.info(f"Received {self.xmi_file.split('tmp/')[1]} from {self.name}.")
+        logger.info(f"Received {os.path.basename(self.xmi_file)} from {self.name}.")
         return xmi_obj # Return the XMI object 
 
     def create_members(self):
@@ -187,7 +211,8 @@ class XMIObject:
 
                 if info.get('mimetype') == 'application/xmit':
                     # Create new XMIObject if member is an xmi file 
-                    XMIObject(f'{self.name}/{m}', f'/tmp/{self.pds}/{m}.xmi', self)
+                    nested_xmi = os.path.join(tempfile.gettempdir(), self.pds, f"{m}.xmi")
+                    XMIObject(f'{self.name}/{m}', nested_xmi, self)
 
 class XMIMember:
     """Class to deal with the members of an XMI file."""
@@ -249,10 +274,10 @@ class XMIMember:
         nested = getattr(self.parent, 'parent', '')
 
         if in_pds:
-            src_dir = f'/tmp/{self.pds}'
+            src_dir = os.path.join(tempfile.gettempdir(), self.pds)
         else:
-            src_dir = f'/tmp'
-        src = f'{src_dir}/{self.name}{self.extension}' # source filepath 
+            src_dir = tempfile.gettempdir()
+        src = os.path.join(src_dir, f"{self.name}{self.extension}") # source filepath 
         dst_dir = self.parent.repopath 
 
         docmimetypes = ['application/msword', 'application/epub+zip', 'application/pdf', 
@@ -302,11 +327,13 @@ class XMIMember:
                 dst = f'{dst_dir}/{self.name}' 
             copy_file(src, dst)
         
-        dst_loc = dst.split(f'{repos}/')[1].split('/', 1)[1]
+        dst_rel = os.path.relpath(dst, repos)
+        dst_parts = Path(dst_rel).parts
+        dst_loc = os.path.join(*dst_parts[1:]) if len(dst_parts) > 1 else dst_rel
         if not in_pds:
             logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}), moved to {dst_loc}' + '\n'
         else:
-            src_loc = src_dir.split('/tmp/')[1]
+            src_loc = os.path.relpath(src_dir, tempfile.gettempdir())
             if self.mimetype == 'application.xmit':
                 logline = f'{datetime.datetime.now()} - Found {self.name}{self.extension} ({self.mimetype}) in {src_loc}, moved to {dst_loc}{self.extension}' + '\n'
             else:
@@ -319,30 +346,30 @@ def parse_arguments():
                                     description= "Extract CBTTapes and update a GitHub profile with data from CBTTape.org if needed.")
     parser.add_argument("--stage", 
                         type = str,
-                        default = f'{os.getcwd()}/stage',
-                        help=f"Full path to stage-folder where zip files from cbttape.org were downloaded to. Defaults to {os.getcwd()}/stage.")
+                        default = str(Path.cwd() / "stage"),
+                        help=f"Full path to stage-folder where zip files from cbttape.org were downloaded to. Defaults to {Path.cwd() / 'stage'}.")
     parser.add_argument("--cbtfiles", 
                         type = str,
-                        default = f'.cbtfiles',
-                        help=f"Full path to the cbtfiles. This is all up-to-date zip files (if you ran --update). Defaults to {os.getcwd()}/.cbtfiles.")
+                        default = str(Path.cwd() / ".cbtfiles"),
+                        help=f"Full path to the cbtfiles. This is all up-to-date zip files (if you ran --update). Defaults to {Path.cwd() / '.cbtfiles'}.")
     parser.add_argument("--repos", 
                         type = str,
-                        default = f'.cbtrepos',
-                        help = f"Full path to local repos folder. Defaults to {os.getcwd()}/.cbtrepos.")
+                        default = str(Path.cwd() / ".cbtrepos"),
+                        help = f"Full path to local repos folder. Defaults to {Path.cwd() / '.cbtrepos'}.")
     parser.add_argument("--only", 
                         type = str,
                         default = False,
                         help = "Only process this CBT Tape (e.g. CBT010).")
     parser.add_argument("--pickle", 
                         type = str,
-                        default = f'.cbt.pkl',
+                        default = '.cbt.pkl',
                         help = "Panda pickle file with parsed UPDATESTOC.txt information. Will be updated during this run. Defaults to .cbt.pkl")
     parser.add_argument("--clean",
                         action = "store_true",
                         help = "Cleans everything except stage folder.")
     parser.add_argument("--noremote",
                         action="store_true",
-                        help=f"Do everything, except remote GitHub actions. (doen't create or updates repos")
+                        help=f"Do everything, except remote GitHub actions. (doesn't create or update repos)")
     args = parser.parse_args()
     return args
 
@@ -365,7 +392,7 @@ def copy_file(src, dst):
         return None
 
 def unzip_xmi(cbt_zip):
-    """Unzip CBT zip file and extract contents to /tmp. Returns extracted XMI file.
+    """Unzip CBT zip file and extract contents to temp dir. Returns extracted XMI file.
     
     arguments:
     cbt_zip (str): Path to the CBT zip file to unzip."""
@@ -378,20 +405,21 @@ def unzip_xmi(cbt_zip):
     # Check that there is was only one file unzipped 
     info = zip_ref.infolist()
     if len(info) == 0:
-        logger.error(f"No files found in ZIP {zip}")
+        logger.error(f"No files found in ZIP {cbt_zip}")
         return None
     if len(info) > 1:
-        logger.error(f"More than one file in ZIP {zip} => {', '.join([file.filename for file in info])}")
+        logger.error(f"More than one file in ZIP {cbt_zip} => {', '.join([file.filename for file in info])}")
         return None
     
     try: 
-        # Extract zip to /tmp directory
-        zip_ref.extractall('/tmp')
+        # Extract zip to temp directory
+        temp_dir = tempfile.gettempdir()
+        zip_ref.extractall(temp_dir)
     except Exception as e:
-        logger.error(f"Unable to extract ZIP {zip}: {e}")
+        logger.error(f"Unable to extract ZIP {cbt_zip}: {e}")
         return None
     
-    xmi_file = f'/tmp/{info[0].filename}' # Get extracted XMI
+    xmi_file = os.path.join(tempfile.gettempdir(), info[0].filename) # Get extracted XMI
     return xmi_file
 
 def readme_file(reponame):
@@ -541,160 +569,159 @@ def commit_git_repo(reponame, repourl, remote_name="origin", branch="main"):
     except subprocess.CalledProcessError as e:
         logger.error(f"Error running Git command for repo {repourl}: {e}")
     return
+def main():
+    global repos, only, GITHUB_CLIENT, GITHUB_OWNER
+    # Parse all arguments 
+    args      = parse_arguments()
+    repos     = args.repos 
+    stage     = args.stage
+    only      = args.only
+    cbtfiles  = args.cbtfiles
+    noremote  = args.noremote
 
-# Parse all arguments 
-args      = parse_arguments()
-repos     = args.repos 
-stage     = args.stage
-only      = args.only
-cbtfiles  = args.cbtfiles
-noremote  = args.noremote
+    if f"{only}" in SKIP:
+        print(f"{only} does not contain an XMI file.")
+        sys.exit(4)
 
-if f"{only}" in SKIP:
-    print(f"{only} does not contain an XMI file.")
-    exit(4)
-
-if not noremote:
-    with open(CONFIG_FILE, "r") as file:
-        config = yaml.safe_load(file)
-    GITHUB_TOKEN = config.get('token')
-    GITHUB_NAME = config.get('name')
-
-    if not GITHUB_TOKEN or not GITHUB_NAME:
-        print("Error: GitHub token or name not found in config.yml")
-        exit(4)
-
-    try:
-        GITHUB_CLIENT = Github(GITHUB_TOKEN)
-
-        try:
-            GITHUB_OWNER = GITHUB_CLIENT.get_organization(GITHUB_NAME)
-            is_org = True
-        except GithubException as e:
-            if e.status == 404:
-                GITHUB_OWNER = GITHUB_CLIENT.get_user()
-                is_org = False
-            else:
-                raise
-
-        print(f"Token has logged into GitHub as {'organization' if is_org else 'user'}: {GITHUB_OWNER.login}")
-    except Exception as e:
-        print(f"Unable to log into GitHub: {e}")
-        exit(4)
-    username = GITHUB_OWNER.login
-
-if args.clean:
-    # Remove local repositories
-    if only:
-        # Only delete the CBT repo indicated by only
-        os.system(f'rm -rf {cbtfiles}/{only}')
-        os.system(f'rm -rf {repos}/{only}')
-        print(f"Removed local repository: {only}")
-    else:
-        os.system(f'rm -rf {cbtfiles}/*')
-        os.system(f'rm -rf {repos}/*')
-        print("Removed all local repositories.")
-
-# Create repo/cbtfile directory if they don't exist
-os.makedirs(repos, exist_ok = True)
-os.makedirs(cbtfiles, exist_ok = True)
-
-# Read pickle
-cbt = pd.read_pickle(args.pickle)
-print(f"Loaded our dataframe, {len(cbt)} CBT-files ready to be processed.")
-
-# Get list of files to process
-to_process = []
-for index, filename in enumerate(os.listdir(stage)):
-    if only:
-        cbtn = f"{only}.zip" 
-        if filename != cbtn: 
-            continue
-
-    # Add path to copied file to list of CBT zips to process
-    src = os.path.join(stage, filename)
-    dst = os.path.join(cbtfiles, filename)
-    if copy_file(src, dst):
-        to_process.append(dst)
-
-if only and len(to_process) == 0:
-    print(f"CBT-file {only} not found.")
-    exit(4)
-
-print(f"Need to process {len(to_process)} CBT zips.")
-
-start = time.time()
-
-for index, zip in enumerate(sorted(to_process)):
-    # Unzip CBT zips to extract XMI files
-    pct = math.floor((index / len(to_process)) * 100)
-    done = math.floor((pct / 100) * 40)
-    todo = 40 - done
-    done_bar = "✅" * done
-    todo_bar = "🟩" * todo
-
-    name = zip.split('/')[1].split('.')[0]
-    if name in SKIP:
-        # Skip for CBT tapes that do not contain XMI files 
-        continue
-    
-    print(f'{done_bar}{todo_bar} Converting {zip} ({pct}%)           ', end='\r', flush=True)
-    logger.info(f"Initialized conversion of {name}.")
-    xmi_file = unzip_xmi(zip) # Extract XMI from zip 
-
-    if xmi_file:
-        # Create an XMIObject to create local repo if xmi was extracted from zip
-        xmi_obj = XMIObject(name, xmi_file)
-    else:
-        # Skip if unable to unzip
-        continue
-
-    if hasattr(xmi_obj, 'success'):
-        # If creating local repo was successful
-        repopath = xmi_obj.repopath
-        logger.info(f"Added all members of {name} to {repopath}.")
-    else:
-        logger.error(f"Error moving members of {name}.")
-        continue
-
+    username = ""
     if not noremote:
-        if index != 0 and index % 10 == 0:
-            print(f'{done_bar}{todo_bar} Sleep for 30s ({pct}%)                             ', end='\r', flush=True)
-            time.sleep(30)
-
-        # Skip the GitHub steps if noremote specified
-        print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True)
-        readme_file(name) # Create README file
-        git_attributes(name) # Create .gitattributes file
-
-        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
-        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
-        if rate_used >= rate_init * 0.9:  
-            # Check if close to hitting the rate limit 
-            time_to_wait = gracetime
-            print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
-            time.sleep(time_to_wait + 1)  
-
-        new_repo = False
         try:
-            repo = GITHUB_OWNER.get_repo(name)
-            repourl = repo.ssh_url
-            logger.info(f"Repo {name} already exists.")
-        except GithubException as e:
-            if e.status == 404:
-                logger.info(f"Repo {name} does not exist.")
-                new_repo = True
-            else:
-                logger.error(f"Error getting GitHub repo {name}: {e}")
-                continue
-        except requests.exceptions.ConnectionError as e:
-            # Why does this keep happening...
-            logger.error(f"Connection error while creating {repo}: {e}")
-            time.sleep(600)
+            with open(CONFIG_FILE, "r") as file:
+                config = yaml.safe_load(file)
+            gh_config = config.get("github") if isinstance(config.get("github"), dict) else config
+            GITHUB_TOKEN = gh_config.get("token")
+            GITHUB_USER_OR_ORG = gh_config.get("name") or gh_config.get("org")
+
+            if not GITHUB_TOKEN or not GITHUB_USER_OR_ORG:
+                print("Error: GitHub token or name/org not found in config.yml")
+                sys.exit(1)
+
+            from github import Github, GithubException
+            GITHUB_CLIENT = Github(GITHUB_TOKEN)
+            try:
+                GITHUB_OWNER = GITHUB_CLIENT.get_organization(GITHUB_USER_OR_ORG)
+                is_org = True
+            except GithubException as e:
+                if e.status == 404:
+                    GITHUB_OWNER = GITHUB_CLIENT.get_user()
+                    is_org = False
+                else:
+                    raise
+
+            print(f"Token has logged into GitHub as {'organization' if is_org else 'user'}: {GITHUB_OWNER.login}")
+            username = GITHUB_OWNER.login
+        except Exception as e:
+            print(f"Error loading config.yml or connecting to GitHub: {e}")
+            sys.exit(1)
+
+    if args.clean:
+        # Remove local repositories
+        cbtfiles_path = Path(cbtfiles)
+        repos_path = Path(repos)
+        if only:
+            # Only delete the CBT repo indicated by only
+            target_cbtfile = cbtfiles_path / only
+            target_repo = repos_path / only
+            if target_cbtfile.exists():
+                if target_cbtfile.is_dir():
+                    shutil.rmtree(target_cbtfile, ignore_errors=True)
+                else:
+                    target_cbtfile.unlink(missing_ok=True)
+            if target_repo.exists():
+                if target_repo.is_dir():
+                    shutil.rmtree(target_repo, ignore_errors=True)
+                else:
+                    target_repo.unlink(missing_ok=True)
+            print(f"Removed local repository: {only}")
+        else:
+            if cbtfiles_path.exists():
+                for item in cbtfiles_path.iterdir():
+                    if item.is_file():
+                        item.unlink(missing_ok=True)
+                    elif item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+            if repos_path.exists():
+                for item in repos_path.iterdir():
+                    if item.is_file():
+                        item.unlink(missing_ok=True)
+                    elif item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+            print("Removed all local repositories.")
+
+    # Create repo/cbtfile directory if they don't exist
+    os.makedirs(repos, exist_ok = True)
+    os.makedirs(cbtfiles, exist_ok = True)
+
+    # Read pickle
+    cbt = pd.read_pickle(args.pickle)
+    print(f"Loaded our dataframe, {len(cbt)} CBT-files ready to be processed.")
+
+    # Get list of files to process
+    to_process = []
+    if os.path.exists(stage):
+        for index, filename in enumerate(os.listdir(stage)):
+            if only:
+                cbtn = f"{only}.zip" 
+                if filename != cbtn: 
+                    continue
+
+            # Add path to copied file to list of CBT zips to process
+            src = os.path.join(stage, filename)
+            dst = os.path.join(cbtfiles, filename)
+            if copy_file(src, dst):
+                to_process.append(dst)
+
+    if only and len(to_process) == 0:
+        print(f"CBT-file {only} not found.")
+        sys.exit(4)
+
+    print(f"Need to process {len(to_process)} CBT zips.")
+
+    start = time.time()
+
+    for index, zip_path in enumerate(sorted(to_process)):
+        # Unzip CBT zips to extract XMI files
+        pct = math.floor((index / len(to_process)) * 100) if to_process else 100
+        done = math.floor((pct / 100) * 40)
+        todo = 40 - done
+        done_bar = "✅" * done
+        todo_bar = "🟩" * todo
+
+        base_name = os.path.basename(zip_path)
+        name = base_name.split('.')[0]
+        if name in SKIP:
+            # Skip for CBT tapes that do not contain XMI files 
             continue
-                    
-        if not new_repo and args.clean:
-            # Remove repo if clean specified
+        
+        print(f'{done_bar}{todo_bar} Converting {zip_path} ({pct}%)           ', end='\r', flush=True)
+        logger.info(f"Initialized conversion of {name}.")
+        xmi_file = unzip_xmi(zip_path) # Extract XMI from zip 
+
+        if xmi_file:
+            # Create an XMIObject to create local repo if xmi was extracted from zip
+            xmi_obj = XMIObject(name, xmi_file)
+        else:
+            # Skip if unable to unzip
+            continue
+
+        if hasattr(xmi_obj, 'success'):
+            # If creating local repo was successful
+            repopath = xmi_obj.repopath
+            logger.info(f"Added all members of {name} to {repopath}.")
+        else:
+            logger.error(f"Error moving members of {name}.")
+            continue
+
+        if not noremote:
+            if index != 0 and index % 10 == 0:
+                print(f'{done_bar}{todo_bar} Sleep for 30s ({pct}%)                             ', end='\r', flush=True)
+                time.sleep(30)
+
+            # Skip the GitHub steps if noremote specified
+            print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True)
+            readme_file(name) # Create README file
+            git_attributes(name) # Create .gitattributes file
+
             rate_used, rate_init = GITHUB_CLIENT.rate_limiting
             gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
             if rate_used >= rate_init * 0.9:  
@@ -703,52 +730,84 @@ for index, zip in enumerate(sorted(to_process)):
                 print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
                 time.sleep(time_to_wait + 1)  
 
-            print(f'{done_bar}{todo_bar} Deleting GitHub repo {name} ({pct}%)            ', end='\r', flush=True)
-            try: 
-                repo.delete()
-                new_repo = True
-                time.sleep(15)
-                logger.info(f"Removed Github repo {repourl}.")
+            new_repo = False
+            try:
+                repo = GITHUB_OWNER.get_repo(name)
+                repourl = repo.ssh_url
+                logger.info(f"Repo {name} already exists.")
             except Exception as e:
-                logger.error(f"Error deleting Github repo {repourl}: {e}")
+                # Check status 404
+                if getattr(e, "status", None) == 404:
+                    logger.info(f"Repo {name} does not exist.")
+                    new_repo = True
+                elif isinstance(e, requests.exceptions.ConnectionError):
+                    logger.error(f"Connection error while accessing {name}: {e}")
+                    time.sleep(600)
+                    continue
+                else:
+                    logger.error(f"Error getting GitHub repo {name}: {e}")
+                    continue
+                        
+            if not new_repo and args.clean:
+                # Remove repo if clean specified
+                rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+                gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+                if rate_used >= rate_init * 0.9:  
+                    # Check if close to hitting the rate limit 
+                    time_to_wait = gracetime
+                    print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
+                    time.sleep(time_to_wait + 1)  
 
-        if new_repo: 
-            # If repository does not exist, create a new one
-            print(f'{done_bar}{todo_bar} Creating GitHub repo {name} ({pct}%)            ', end='\r', flush=True)
-            repourl = create_git_repo(name)
+                print(f'{done_bar}{todo_bar} Deleting GitHub repo {name} ({pct}%)            ', end='\r', flush=True)
+                try: 
+                    repo.delete()
+                    new_repo = True
+                    time.sleep(15)
+                    logger.info(f"Removed Github repo {repourl}.")
+                except Exception as e:
+                    logger.error(f"Error deleting Github repo {repourl}: {e}")
+
+            if new_repo: 
+                # If repository does not exist, create a new one
+                print(f'{done_bar}{todo_bar} Creating GitHub repo {name} ({pct}%)            ', end='\r', flush=True)
+                repourl = create_git_repo(name)
+                time.sleep(15)
+                if not repourl:
+                    # Continue if problems creating git repo
+                    continue
+            
+            rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+            gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+            if rate_used >= rate_init * 0.9:  
+                # Check if close to hitting the rate limit 
+                time_to_wait = gracetime
+                print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
+                time.sleep(time_to_wait + 1)  
+
+            print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True) 
+            commit_git_repo(name, repourl) # Commit updates 
             time.sleep(15)
-            if not repourl:
-                # Continue if problems creating git repo
-                continue
+
+            rate_used, rate_init = GITHUB_CLIENT.rate_limiting
+            gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
+            if gracetime > 0:
+                print(f'{done_bar}{todo_bar} Rate critical ({rate_used}/{rate_init}), gracetime={gracetime} ({pct}%) '   , end='\r', flush=True)
+                time.sleep(gracetime*3)
         
-        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
-        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
-        if rate_used >= rate_init * 0.9:  
-            # Check if close to hitting the rate limit 
-            time_to_wait = gracetime
-            print(f'{done_bar}{todo_bar} Rate limit reached, waiting for {time_to_wait:.2f}s ({pct}%) ', end='\r', flush=True)
-            time.sleep(time_to_wait + 1)  
+        logger.info(f"Completed conversion of {name}.")
 
-        print(f'{done_bar}{todo_bar} Updating GitHub repo {name} ({pct}%)             ', end='\r', flush=True) 
-        commit_git_repo(name, repourl) # Commit updates 
-        time.sleep(15)
+    done = 40 * "✅" 
+    pct = 100
+    z=''
+    print(f'{done} {z} ({pct}%)                                                  ', flush=True)
 
-        rate_used, rate_init = GITHUB_CLIENT.rate_limiting
-        gracetime = (GITHUB_CLIENT.rate_limiting_resettime-math.floor(time.time())) / 1000
-        if gracetime > 0:
-            print(f'{done_bar}{todo_bar} Rate critical ({rate_used}/{rate_init}), gracetime={gracetime} ({pct}%) '   , end='\r', flush=True)
-            time.sleep(gracetime*3)
-    
-    logger.info(f"Completed conversion of {name}.")
+    stop = time.time()
+    if not noremote:
+        print(f'All requested CBT files converted to Github repos in github.com/{username}.')
+    else:
+        print(f'All requested CBT files converted and moved to {repos}')
+    print(f'This operation took {datetime.timedelta(seconds=stop-start)}')
 
-done = 40 * "✅" 
-pct = 100
-z=''
-print(f'{done} {z} ({pct}%)                                                  ', flush=True)
 
-stop = time.time()
-if not noremote:
-    print(f'All requested CBT files converted to Github repos in github.com/{username}.')
-else:
-    print(f'All requested CBT files converted and moved to {repos}')
-print(f'This operation took {datetime.timedelta(seconds=stop-start)}')
+if __name__ == "__main__":
+    main()

@@ -1,3 +1,4 @@
+config.yml
 virtualenv/bin/*
 virtualenv/include/*
 virtualenv/lib*
