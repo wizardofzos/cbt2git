@@ -8,3 +8,12 @@ cbtfiles/*
 cbtraw/*
 .cbtfiles/*
 *.pkl
+__pycache__/
+*.egg-info/
+build/
+dist/
+stage/
+cbt.xlsx
+updates
+CATALOG.md
+index.html
