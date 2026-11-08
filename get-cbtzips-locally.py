@@ -1,4 +1,4 @@
-#!/bin/env python
+#!/usr/bin/env python
 """Downloads (and refreshes) all CBT-files from cbttape.org to your local machine.
 Initial download of all takes about 3.5 minutes.
 Refresh without any new or updated files takes abount 90 seconds.

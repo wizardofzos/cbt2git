@@ -1,4 +1,4 @@
-# Token needs to be classic (and needs delete repo auth)
+# Copy this to config.yml. Token needs to be classic (and needs delete repo auth)
+github:
   token: YOUR_GITHUB_TOKEN_HERE
   name: YOUR_NAME_OR_ORGANIZATION_HERE
-

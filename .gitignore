@@ -8,3 +8,8 @@ cbtfiles/*
 cbtraw/*
 .cbtfiles/*
 *.pkl
+__pycache__/
+config.yml
+stage/*
+updates
+cbt.xlsx
